@@ -1,0 +1,15 @@
+.venv/
+.jax_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.tp32-job-*.lock
+checkpoints/
+eval-results/
+results/
+benchmark-results/
+logs/
+slurm-*.out
+.tp8-job-*.lock
+dev/
+.env

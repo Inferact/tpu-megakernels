@@ -1,0 +1,52 @@
+task: gpqa_diamond_reasoning
+dataset_path: Idavidrein/gpqa
+dataset_name: gpqa_diamond
+output_type: generate_until
+process_docs: !function lm_eval.tasks.gpqa.cot_zeroshot.utils.process_docs
+training_split: train
+validation_split: train
+test_split: null
+doc_to_text: |-
+  Please answer the following graduate-level question by selecting the correct option.
+
+  Provide your answer in the following format:
+  1. Show your reasoning process
+  2. End with your final answer as: "The answer is (X)" where X is one of the option letters (A, B, C, or D)
+
+  Example:
+  [Your reasoning here]
+  Therefore, the answer is (B)
+
+  Question: {{Question}}
+
+  Options:
+  A. {{choice1}}
+  B. {{choice2}}
+  C. {{choice3}}
+  D. {{choice4}}
+
+  Answer:
+doc_to_target: answer
+filter_list:
+  - name: flexible-extract
+    filter:
+      - function: multi_choice_regex
+        group_select: -1
+        ignore_case: true
+        ignore_punctuation: true
+        regex_pattern: "(\\([A-D]\\))"
+      - function: take_first
+generation_kwargs:
+  until:
+    - "</s>"
+  do_sample: false
+  temperature: 0.0
+num_fewshot: 0
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: true
+metadata:
+  version: 1.0
