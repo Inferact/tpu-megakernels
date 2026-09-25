@@ -22,10 +22,10 @@
                     <!-- <text x="62" y="66.2" class="svg-label-sm" text-anchor="end">800</text> -->
                     <path d="M 128 85.4 Q 128 82.4 131 82.4 H 199 Q 202 82.4 202 85.4 V 240 H 128 Z" fill="var(--dma)"/>
                     <text x="165" y="76.4" class="svg-label-sm" text-anchor="middle">709</text>
-                    <text x="165" y="258" class="svg-label-sm" text-anchor="middle">16&times; TPU v7</text>
+                    <text x="165" y="258" class="svg-label-sm" text-anchor="middle">16&#215; TPU v7</text>
                     <path d="M 208 142.5 Q 208 139.5 211 139.5 H 279 Q 282 139.5 282 142.5 V 240 H 208 Z" fill="var(--baseline)"/>
                     <text x="245" y="133.5" class="svg-label-sm" text-anchor="middle">452</text>
-                    <text x="245" y="258" class="svg-label-sm" text-anchor="middle">16&times; GB200</text>
+                    <text x="245" y="258" class="svg-label-sm" text-anchor="middle">16&#215; GB200</text>
 
                     <!-- RIGHT PANEL — Qwen 3.8 27B, 0-1600 -->
                     <!-- <text x="422" y="44" class="svg-label-sm" text-anchor="end">tok/s</text> -->
@@ -41,8 +41,8 @@
                     <!-- <text x="422" y="66.2" class="svg-label-sm" text-anchor="end">1,600</text> -->
                     <path d="M 488 74.6 Q 488 71.6 491 71.6 H 559 Q 562 71.6 562 74.6 V 240 H 488 Z" fill="var(--dma)"/>
                     <text x="525" y="65.6" class="svg-label-sm" text-anchor="middle">1,515</text>
-                    <text x="525" y="258" class="svg-label-sm" text-anchor="middle">4&times; TPU v7</text>
+                    <text x="525" y="258" class="svg-label-sm" text-anchor="middle">4&#215; TPU v7</text>
                     <path d="M 568 165.8 Q 568 162.8 571 162.8 H 639 Q 642 162.8 642 165.8 V 240 H 568 Z" fill="var(--baseline)"/>
                     <text x="605" y="156.8" class="svg-label-sm" text-anchor="middle">695</text>
-                    <text x="605" y="258" class="svg-label-sm" text-anchor="middle">4&times; GB200</text>
+                    <text x="605" y="258" class="svg-label-sm" text-anchor="middle">4&#215; GB200</text>
                 </svg>

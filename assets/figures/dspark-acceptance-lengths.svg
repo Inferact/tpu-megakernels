@@ -16,11 +16,11 @@
                     <path d="M 170 76 H 307.3 Q 310.3 76 310.3 79 V 105 Q 310.3 108 307.3 108 H 170 Z" fill="var(--baseline)"/>
                     <text x="318.3" y="97" class="svg-label-sm">229</text>
                     <text x="158" y="68" class="svg-label" text-anchor="end">acceptance length 3</text>
-                    <text x="158" y="84" class="svg-label-sm" text-anchor="end">1.53&times; faster</text>
+                    <text x="158" y="84" class="svg-label-sm" text-anchor="end">1.53&#215; faster</text>
                     <path d="M 170 128 H 601.3 Q 604.3 128 604.3 131 V 157 Q 604.3 160 601.3 160 H 170 Z" fill="var(--dma)"/>
                     <text x="612.3" y="149" class="svg-label-sm">709</text>
                     <path d="M 170 164 H 443.9 Q 446.9 164 446.9 167 V 193 Q 446.9 196 443.9 196 H 170 Z" fill="var(--baseline)"/>
                     <text x="454.9" y="185" class="svg-label-sm">452</text>
                     <text x="158" y="156" class="svg-label" text-anchor="end">acceptance length 6</text>
-                    <text x="158" y="172" class="svg-label-sm" text-anchor="end">1.57&times; faster</text>
+                    <text x="158" y="172" class="svg-label-sm" text-anchor="end">1.57&#215; faster</text>
                 </svg>
