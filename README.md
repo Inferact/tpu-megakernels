@@ -1,5 +1,14 @@
 # TPU megakernels for Kimi K3 and Qwen3.8-27B
 
+<p align="center">
+  <a href="https://inferact.ai/blog/tpu-megakernels">
+    <img src="assets/figures/hero.png" alt="TPU megakernel: 709 tokens per second on Kimi K3, 16x TPU v7 vs 452 on 16x GB200" width="100%">
+  </a>
+</p>
+
+Companion code for the blog post
+[700 TPS on Kimi K3: A Case for TPU Megakernels](https://inferact.ai/blog/tpu-megakernels).
+
 This repository contains fused decode implementations for two models:
 
 - **Kimi K3 + DSpark** runs on 32 TPU devices across four hosts. One megakernel
@@ -11,6 +20,32 @@ This repository contains fused decode implementations for two models:
   stack, with an optional fused DFlash2 speculative-decoding loop.
 
 Both demos support terminal interaction and an OpenAI-compatible HTTP server.
+
+## Results
+
+With speculative decoding at an acceptance length of 6, the megakernels reach
+709 accepted tokens per second on Kimi K3 (16× TPU v7 vs 16× GB200, 1.57×) and
+1,515 on Qwen3.8-27B (4× TPU v7 vs 4× GB200, 2.18×):
+
+<p align="center">
+  <img src="assets/figures/spec-decode-throughput.svg" alt="Speculative decode throughput at acceptance length 6: Kimi K3 709 vs 452 tokens/s; Qwen3.8-27B 1,515 vs 695 tokens/s" width="720">
+</p>
+
+DSpark keeps a large lead at shorter acceptance lengths as well:
+
+<p align="center">
+  <img src="assets/figures/dspark-acceptance-lengths.svg" alt="Accepted tokens per second with DSpark speculative decoding at acceptance lengths 3 and 6" width="720">
+</p>
+
+Without speculative decoding, the megakernels deliver roughly 1.4–2× the
+decode throughput of the GB200 baseline at batch sizes 1 through 8:
+
+<p align="center">
+  <img src="assets/figures/batch-decode-throughput.svg" alt="Aggregate decode throughput at batch sizes 1, 2, 4 and 8, TPU megakernel vs GB200 baseline" width="720">
+</p>
+
+See the [blog post](https://inferact.ai/blog/tpu-megakernels) for the full
+analysis and measurement setup.
 
 ## Setup
 
@@ -119,3 +154,19 @@ either launcher interactively.
 
 Generated weights, checkpoints, compilation caches, evaluation output,
 benchmark output, and Slurm logs are excluded from version control.
+
+## Citation
+
+If you use this codebase or build on our results, please cite the companion
+blog post:
+
+```bibtex
+@misc{novack2026tpumegakernels,
+  author       = {Novack, George and Liu, Xuting and Ma, Jeff and Kwon, Woosuk},
+  title        = {700 TPS on Kimi K3: A Case for TPU Megakernels},
+  howpublished = {\url{https://inferact.ai/blog/tpu-megakernels}},
+  year         = {2026},
+  month        = sep,
+  note         = {Inferact blog post, September 23, 2026},
+}
+```

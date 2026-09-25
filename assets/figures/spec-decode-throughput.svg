@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 272" role="img" aria-label="Two panels of speculative decode throughput at an acceptance length of 6, one per model, each with its own scale. On Kimi K3, served on 16 chips each, the TPU megakernel reaches 709 accepted tokens per second against the GB200 baseline's 452, 1.57 times faster. On Qwen 3.8 27B, served on 4 chips each, it reaches 1,515 against 695, 2.18 times faster."><style>:root{--ink:#323842;--dma:#3B9EFF;--ici:#70C1FF;--vmem:#C4B5FD;--vec:#F0EE82;--compute:#323842;--wait:rgba(50,56,66,0.16);--baseline:#D7D8D7;--rule:rgba(50,56,66,0.15);--muted:#666;--field:#E2F1FB;}.svg-label{font-family:"STK Bureau Sans Semi-Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;fill:#323842;}.svg-label-sm{font-family:"STK Bureau Sans Semi-Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;fill:#666;}.svg-rule{stroke:rgba(50,56,66,0.15);stroke-width:1;}</style><rect width="100%" height="100%" fill="#FAFAFD"/>
+                    <!-- panel headers -->
+                    <text x="70" y="22" class="svg-label">Kimi K3</text>
+                    <text x="340" y="22" class="svg-label-sm" text-anchor="end">tokens / second</text>
+                    <text x="430" y="22" class="svg-label">Qwen 3.8 27B</text>
+                    <text x="700" y="22" class="svg-label-sm" text-anchor="end">tokens / second</text>
+
+                    <!-- hard cut between the two fields -->
+                    <line x1="385" y1="10" x2="385" y2="266" class="svg-rule"/>
+
+                    <!-- LEFT PANEL — Kimi K3, 0-800 -->
+                    <!-- <text x="62" y="44" class="svg-label-sm" text-anchor="end">tok/s</text> -->
+                    <line x1="70" y1="240.0" x2="340" y2="240.0" class="svg-rule"/>
+                    <!-- <text x="62" y="244.0" class="svg-label-sm" text-anchor="end">0</text> -->
+                    <line x1="70" y1="195.6" x2="340" y2="195.6" class="svg-rule" stroke-dasharray="2 4"/>
+                    <!-- <text x="62" y="199.6" class="svg-label-sm" text-anchor="end">200</text> -->
+                    <line x1="70" y1="151.1" x2="340" y2="151.1" class="svg-rule" stroke-dasharray="2 4"/>
+                    <!-- <text x="62" y="155.1" class="svg-label-sm" text-anchor="end">400</text> -->
+                    <line x1="70" y1="106.7" x2="340" y2="106.7" class="svg-rule" stroke-dasharray="2 4"/>
+                    <!-- <text x="62" y="110.7" class="svg-label-sm" text-anchor="end">600</text> -->
+                    <line x1="70" y1="62.2" x2="340" y2="62.2" class="svg-rule" stroke-dasharray="2 4"/>
+                    <!-- <text x="62" y="66.2" class="svg-label-sm" text-anchor="end">800</text> -->
+                    <path d="M 128 85.4 Q 128 82.4 131 82.4 H 199 Q 202 82.4 202 85.4 V 240 H 128 Z" fill="var(--dma)"/>
+                    <text x="165" y="76.4" class="svg-label-sm" text-anchor="middle">709</text>
+                    <text x="165" y="258" class="svg-label-sm" text-anchor="middle">16&times; TPU v7</text>
+                    <path d="M 208 142.5 Q 208 139.5 211 139.5 H 279 Q 282 139.5 282 142.5 V 240 H 208 Z" fill="var(--baseline)"/>
+                    <text x="245" y="133.5" class="svg-label-sm" text-anchor="middle">452</text>
+                    <text x="245" y="258" class="svg-label-sm" text-anchor="middle">16&times; GB200</text>
+
+                    <!-- RIGHT PANEL — Qwen 3.8 27B, 0-1600 -->
+                    <!-- <text x="422" y="44" class="svg-label-sm" text-anchor="end">tok/s</text> -->
+                    <line x1="430" y1="240.0" x2="700" y2="240.0" class="svg-rule"/>
+                    <!-- <text x="422" y="244.0" class="svg-label-sm" text-anchor="end">0</text> -->
+                    <line x1="430" y1="195.6" x2="700" y2="195.6" class="svg-rule" stroke-dasharray="2 4"/>
+                    <!-- <text x="422" y="199.6" class="svg-label-sm" text-anchor="end">400</text> -->
+                    <line x1="430" y1="151.1" x2="700" y2="151.1" class="svg-rule" stroke-dasharray="2 4"/>
+                    <!-- <text x="422" y="155.1" class="svg-label-sm" text-anchor="end">800</text> -->
+                    <line x1="430" y1="106.7" x2="700" y2="106.7" class="svg-rule" stroke-dasharray="2 4"/>
+                    <!-- <text x="422" y="110.7" class="svg-label-sm" text-anchor="end">1,200</text> -->
+                    <line x1="430" y1="62.2" x2="700" y2="62.2" class="svg-rule" stroke-dasharray="2 4"/>
+                    <!-- <text x="422" y="66.2" class="svg-label-sm" text-anchor="end">1,600</text> -->
+                    <path d="M 488 74.6 Q 488 71.6 491 71.6 H 559 Q 562 71.6 562 74.6 V 240 H 488 Z" fill="var(--dma)"/>
+                    <text x="525" y="65.6" class="svg-label-sm" text-anchor="middle">1,515</text>
+                    <text x="525" y="258" class="svg-label-sm" text-anchor="middle">4&times; TPU v7</text>
+                    <path d="M 568 165.8 Q 568 162.8 571 162.8 H 639 Q 642 162.8 642 165.8 V 240 H 568 Z" fill="var(--baseline)"/>
+                    <text x="605" y="156.8" class="svg-label-sm" text-anchor="middle">695</text>
+                    <text x="605" y="258" class="svg-label-sm" text-anchor="middle">4&times; GB200</text>
+                </svg>

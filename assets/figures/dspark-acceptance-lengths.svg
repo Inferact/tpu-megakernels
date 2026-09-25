@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 260" role="img" aria-label="Horizontal bar chart of accepted output tokens per second with DSpark speculative decoding. At an acceptance length of 3 the TPU megakernel reaches 350 tokens per second against the GB200 baseline's 229, 1.53 times faster. At an acceptance length of 6 it reaches 709 against 452, 1.57 times faster."><style>:root{--ink:#323842;--dma:#3B9EFF;--ici:#70C1FF;--vmem:#C4B5FD;--vec:#F0EE82;--compute:#323842;--wait:rgba(50,56,66,0.16);--baseline:#D7D8D7;--rule:rgba(50,56,66,0.15);--muted:#666;--field:#E2F1FB;}.svg-label{font-family:"STK Bureau Sans Semi-Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;fill:#323842;}.svg-label-sm{font-family:"STK Bureau Sans Semi-Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;fill:#666;}.svg-rule{stroke:rgba(50,56,66,0.15);stroke-width:1;}</style><rect width="100%" height="100%" fill="#FAFAFD"/>
+                    <line x1="170.0" y1="34" x2="170.0" y2="212" class="svg-rule"/>
+                    <text x="170.0" y="228" class="svg-label-sm" text-anchor="middle">0</text>
+                    <line x1="292.5" y1="34" x2="292.5" y2="212" class="svg-rule" stroke-dasharray="2 4"/>
+                    <text x="292.5" y="228" class="svg-label-sm" text-anchor="middle">200</text>
+                    <line x1="415.0" y1="34" x2="415.0" y2="212" class="svg-rule" stroke-dasharray="2 4"/>
+                    <text x="415.0" y="228" class="svg-label-sm" text-anchor="middle">400</text>
+                    <line x1="537.5" y1="34" x2="537.5" y2="212" class="svg-rule" stroke-dasharray="2 4"/>
+                    <text x="537.5" y="228" class="svg-label-sm" text-anchor="middle">600</text>
+                    <line x1="660.0" y1="34" x2="660.0" y2="212" class="svg-rule" stroke-dasharray="2 4"/>
+                    <text x="660.0" y="228" class="svg-label-sm" text-anchor="middle">800</text>
+                    <line x1="170" y1="212" x2="660" y2="212" class="svg-rule"/>
+                    <text x="415" y="248" class="svg-label-sm" text-anchor="middle">accepted output tokens / second</text>
+                    <path d="M 170 40 H 381.4 Q 384.4 40 384.4 43 V 69 Q 384.4 72 381.4 72 H 170 Z" fill="var(--dma)"/>
+                    <text x="392.4" y="61" class="svg-label-sm">350</text>
+                    <path d="M 170 76 H 307.3 Q 310.3 76 310.3 79 V 105 Q 310.3 108 307.3 108 H 170 Z" fill="var(--baseline)"/>
+                    <text x="318.3" y="97" class="svg-label-sm">229</text>
+                    <text x="158" y="68" class="svg-label" text-anchor="end">acceptance length 3</text>
+                    <text x="158" y="84" class="svg-label-sm" text-anchor="end">1.53&times; faster</text>
+                    <path d="M 170 128 H 601.3 Q 604.3 128 604.3 131 V 157 Q 604.3 160 601.3 160 H 170 Z" fill="var(--dma)"/>
+                    <text x="612.3" y="149" class="svg-label-sm">709</text>
+                    <path d="M 170 164 H 443.9 Q 446.9 164 446.9 167 V 193 Q 446.9 196 443.9 196 H 170 Z" fill="var(--baseline)"/>
+                    <text x="454.9" y="185" class="svg-label-sm">452</text>
+                    <text x="158" y="156" class="svg-label" text-anchor="end">acceptance length 6</text>
+                    <text x="158" y="172" class="svg-label-sm" text-anchor="end">1.57&times; faster</text>
+                </svg>
