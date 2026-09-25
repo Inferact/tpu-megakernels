@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 280" role="img" aria-label="Grouped vertical bar chart of aggregate decode throughput in tokens per second at batch sizes 1, 2, 4 and 8. The Kimi K3 TPU megakernel reaches 249, 392, 515 and 865 tokens per second against the GB200 baseline's 127, 227, 373 and 636, an advantage of 1.96, 1.73, 1.38 and 1.36 times respectively. The lead is widest at batch size 1 and narrows as batch size grows."><style>:root{--ink:#323842;--dma:#3B9EFF;--ici:#70C1FF;--vmem:#C4B5FD;--vec:#F0EE82;--compute:#323842;--wait:rgba(50,56,66,0.16);--baseline:#D7D8D7;--rule:rgba(50,56,66,0.15);--muted:#666;--field:#E2F1FB;}.svg-label{font-family:"STK Bureau Sans Semi-Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;fill:#323842;}.svg-label-sm{font-family:"STK Bureau Sans Semi-Mono","Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:9.5px;fill:#666;}.svg-rule{stroke:rgba(50,56,66,0.15);stroke-width:1;}</style><rect width="100%" height="100%" fill="#FAFAFD"/>
+                    <line x1="70" y1="240.0" x2="700" y2="240.0" class="svg-rule"/>
+                    <text x="62" y="244.0" class="svg-label-sm" text-anchor="end">0</text>
+                    <line x1="70" y1="195.6" x2="700" y2="195.6" class="svg-rule" stroke-dasharray="2 4"/>
+                    <text x="62" y="199.6" class="svg-label-sm" text-anchor="end">200</text>
+                    <line x1="70" y1="151.1" x2="700" y2="151.1" class="svg-rule" stroke-dasharray="2 4"/>
+                    <text x="62" y="155.1" class="svg-label-sm" text-anchor="end">400</text>
+                    <line x1="70" y1="106.7" x2="700" y2="106.7" class="svg-rule" stroke-dasharray="2 4"/>
+                    <text x="62" y="110.7" class="svg-label-sm" text-anchor="end">600</text>
+                    <line x1="70" y1="62.2" x2="700" y2="62.2" class="svg-rule" stroke-dasharray="2 4"/>
+                    <text x="62" y="66.2" class="svg-label-sm" text-anchor="end">800</text>
+                    <text x="62" y="30" class="svg-label-sm" text-anchor="end">tok/s</text>
+                    <path d="M 90.5 187.7 Q 90.5 184.7 93.5 184.7 H 137.5 Q 140.5 184.7 140.5 187.7 V 240 H 90.5 Z" fill="var(--dma)"/>
+                    <text x="115.5" y="178.7" class="svg-label-sm" text-anchor="middle">249</text>
+                    <path d="M 144.5 214.9 Q 144.5 211.9 147.5 211.9 H 191.5 Q 194.5 211.9 194.5 214.9 V 240 H 144.5 Z" fill="var(--baseline)"/>
+                    <text x="169.5" y="205.9" class="svg-label-sm" text-anchor="middle">127</text>
+                    <text x="142.5" y="260" class="svg-label" text-anchor="middle">1</text>
+                    <path d="M 235.5 156.0 Q 235.5 153.0 238.5 153.0 H 282.5 Q 285.5 153.0 285.5 156.0 V 240 H 235.5 Z" fill="var(--dma)"/>
+                    <text x="260.5" y="147.0" class="svg-label-sm" text-anchor="middle">392</text>
+                    <path d="M 289.5 192.6 Q 289.5 189.6 292.5 189.6 H 336.5 Q 339.5 189.6 339.5 192.6 V 240 H 289.5 Z" fill="var(--baseline)"/>
+                    <text x="314.5" y="183.6" class="svg-label-sm" text-anchor="middle">227</text>
+                    <text x="287.5" y="260" class="svg-label" text-anchor="middle">2</text>
+                    <path d="M 380.5 128.5 Q 380.5 125.5 383.5 125.5 H 427.5 Q 430.5 125.5 430.5 128.5 V 240 H 380.5 Z" fill="var(--dma)"/>
+                    <text x="405.5" y="119.5" class="svg-label-sm" text-anchor="middle">515</text>
+                    <path d="M 434.5 160.2 Q 434.5 157.2 437.5 157.2 H 481.5 Q 484.5 157.2 484.5 160.2 V 240 H 434.5 Z" fill="var(--baseline)"/>
+                    <text x="459.5" y="151.2" class="svg-label-sm" text-anchor="middle">373</text>
+                    <text x="432.5" y="260" class="svg-label" text-anchor="middle">4</text>
+                    <path d="M 525.5 50.7 Q 525.5 47.7 528.5 47.7 H 572.5 Q 575.5 47.7 575.5 50.7 V 240 H 525.5 Z" fill="var(--dma)"/>
+                    <text x="550.5" y="41.7" class="svg-label-sm" text-anchor="middle">865</text>
+                    <path d="M 579.5 101.7 Q 579.5 98.7 582.5 98.7 H 626.5 Q 629.5 98.7 629.5 101.7 V 240 H 579.5 Z" fill="var(--baseline)"/>
+                    <text x="604.5" y="92.7" class="svg-label-sm" text-anchor="middle">636</text>
+                    <text x="577.5" y="260" class="svg-label" text-anchor="middle">8</text>
+                    <text x="62" y="260" class="svg-label-sm" text-anchor="end">batch size</text>
+                </svg>
