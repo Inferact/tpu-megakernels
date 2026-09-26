@@ -153,13 +153,26 @@ class Session:
         self.prefill_buckets = set()  # padded lengths already compiled
         self.decode = build_decode(mesh, cfg, args.context, batch, args.greedy)
         self.chunk = make_chunk(self.decode, args.steps_per_call, cfg, args.greedy, args.top_k)
-        self.key = jax.random.key(args.seed)
+        self.replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        self.key = self.replicate_key(jax.random.key(args.seed))
         self.first_sampler = jax.jit(
             lambda logits, key, t, p: sampling.sample(
                 sampling.mask_unused(logits, cfg)[None], key, t, args.top_k, p
             )[0]
         )
         self.first_greedy = jax.jit(lambda logits: jnp.argmax(sampling.mask_unused(logits, cfg)))
+
+    def replicate(self, x):
+        """Small int32 array replicated on the mesh (the sharding the decode program returns):
+        jit specialises on input shardings, so a plain single-device `jnp.asarray` for the
+        first call and the program's own replicated outputs for the later ones would compile
+        the chunk program twice."""
+        return jax.device_put(jnp.asarray(x, jnp.int32), self.replicated)
+
+    def replicate_key(self, key):
+        """The chunk program returns its key replicated on the mesh; a fresh single-device key
+        would compile the program a second time (see `replicate`)."""
+        return jax.device_put(key, self.replicated)
 
     def next_key(self):
         self.key, sub = jax.random.split(self.key)
@@ -207,7 +220,7 @@ class Session:
         temperature = self.args.temperature if temperature is None else temperature
         top_p = self.args.top_p if top_p is None else top_p
         if seed is not None:
-            self.key = jax.random.key(seed)
+            self.key = self.replicate_key(jax.random.key(seed))
         cfg = self.cfg
         n = len(prompts)
         first = np.full((self.batch,), cfg.pad, np.int32)
@@ -248,7 +261,7 @@ class Session:
                 emitted[b] = len(generated[b])
 
         emit()
-        cur, pos_dev = jnp.asarray(first), jnp.asarray(pos)
+        cur, pos_dev = self.replicate(first), self.replicate(pos)
         steps = 0
         started = time.perf_counter()
         while not all(finished) and int(pos.max()) + self.args.steps_per_call <= self.context:
@@ -296,9 +309,9 @@ def run_bench(mesh, cfg, weights, args, prompt_ids, log):
         # fill every row with the prompt, warm one device call, then time the rest
         for b in range(batch):
             session.prefill(prompt_ids, b)
-        pos = jnp.full((batch,), len(prompt_ids), jnp.int32)
-        cur = jnp.full((batch,), int(prompt_ids[-1]), jnp.int32)
-        key = jax.random.key(0)
+        pos = session.replicate(np.full((batch,), len(prompt_ids)))
+        cur = session.replicate(np.full((batch,), int(prompt_ids[-1])))
+        key = session.replicate_key(jax.random.key(0))
         t, p = jnp.float32(args.temperature), jnp.float32(args.top_p)
         cur, session.caches, out, key = session.chunk(weights, session.caches, cur, pos, key, t, p)
         out.block_until_ready()
