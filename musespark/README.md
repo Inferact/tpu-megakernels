@@ -380,7 +380,7 @@ With the int8 dense projections + `lm_head` (`dense_format` int8, the
 container's default since `quantize-dense` ran; `perf_log.md` E15), same
 benchmark, NVFP4 experts:
 
-| B | bf16 dense ms/step (`logs/..._20260926T070309Z.log`) | int8 dense ms/step (default path, `logs/..._20260926T083134Z.log`) | tok/s per row | tok/s aggr. |
+| B | bf16 dense ms/step (`logs/..._20260926T070309Z.log`) | int8 dense ms/step (default path, `logs/..._20260926T083121Z.log`) | tok/s per row | tok/s aggr. |
 |---|---:|---:|---:|---:|
 | 1 | 3.565 | **3.260** | **306.8** | 307 |
 | 2 | 4.070 | 3.657 | 273.4 | 547 |
