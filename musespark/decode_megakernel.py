@@ -98,7 +98,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 import musespark
-from musespark import attention, collectives, layout, moe, sampling, stream
+from musespark import attention, collectives, fp4, layout, moe, sampling, stream
 from musespark.config import Config
 
 BF16 = jnp.bfloat16
@@ -114,6 +114,40 @@ LOGIT_ROWS = moe.MR  # 8: rows of the lm_head accumulator (the MXU row block)
 WEIGHT_NAMES = (
     layout.STREAMED_FAMILIES + layout.VECTOR_FAMILIES + layout.EXPERT_FAMILIES + ("lm_head",)
 )
+
+
+def weight_names(expert_format="int4"):
+    """Kernel operand order: streamed, vector, expert (`layout.expert_families`), lm_head."""
+    return (
+        layout.STREAMED_FAMILIES
+        + layout.VECTOR_FAMILIES
+        + layout.expert_families(expert_format)
+        + ("lm_head",)
+    )
+
+
+def _expert_module(expert_format):
+    """`moe` (int4 g128) or `fp4` (NVFP4) -- drop-in twins (`ExpertWeights`, `Scratch`,
+    `scratch_shapes`, `start_expert_stream`, `expert_stream`)."""
+    if expert_format == "int4":
+        return SimpleNamespace(
+            scratch_shapes=moe.scratch_shapes,
+            bind=moe.MoeScratch.bind,
+            weights=lambda w: moe.ExpertWeights(*(w[n] for n in layout.EXPERT_FAMILIES)),
+            start=moe.start_expert_stream,
+            stream=moe.expert_stream,
+        )
+    if expert_format == "nvfp4":
+        return SimpleNamespace(
+            scratch_shapes=lambda cfg, batch, tp, slots, packed=True: fp4.scratch_shapes(
+                cfg, batch, tp, slots
+            ),
+            bind=fp4.Fp4Scratch.bind,
+            weights=fp4.Fp4ExpertWeights.from_dict,
+            start=fp4.start_expert_stream,
+            stream=fp4.expert_stream,
+        )
+    raise ValueError(f"unknown expert_format {expert_format!r}")
 
 
 # --------------------------------------------------------------------------------------
@@ -214,10 +248,11 @@ def default_hier(batch):
 
 def scratch_shapes(
     cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=False, wire=BF16,
-    banks=layout.BANKS, packed=True, hier=None,
+    banks=layout.BANKS, packed=True, hier=None, expert_format="int4",
 ):
     """The kernel's scratch, grouped: `{group: tuple of pltpu.VMEM / semaphores}` in order.
-    `packed=False` (interpret mode) uses plain int4 expert slots."""
+    `packed=False` (interpret mode) uses plain int4 expert slots; `expert_format` selects the
+    int4 (`moe`) or NVFP4 (`fp4`) expert slots."""
     rows, width, gather_width = _collective_geometry(cfg, batch, tp)
     hq, hkv, D = cfg.heads // tp, cfg.kv_heads // tp, cfg.head_dim
     vectors = []
@@ -238,7 +273,7 @@ def scratch_shapes(
             pltpu.VMEM((batch, 2 * hkv * D), F32),
             pltpu.VMEM((batch, hq * D), F32),
         ),
-        "moe": moe.scratch_shapes(cfg, batch, tp, moe_slots, packed),
+        "moe": _expert_module(expert_format).scratch_shapes(cfg, batch, tp, moe_slots, packed),
         "vectors": tuple(vectors),
         "activations": (
             pltpu.VMEM((batch, cfg.hidden), F32),  # residual stream s
@@ -253,30 +288,38 @@ def scratch_shapes(
 VMEM_EXPLICIT_LIMIT = 58 * MIB  # hw report: leave >= ~6 MiB for spills / internal scratch
 
 
-def default_moe_slots(cfg: Config, batch, tp=8, aux_hidden=False, wire=BF16, banks=layout.BANKS):
+def default_moe_slots(
+    cfg: Config, batch, tp=8, aux_hidden=False, wire=BF16, banks=layout.BANKS,
+    expert_format="int4",
+):
     """Largest expert slot count `<= moe.SLOTS` (at least 2) whose explicit VMEM total fits
-    `VMEM_EXPLICIT_LIMIT` (real config with the packed slots: 4 for every B <= 8)."""
+    `VMEM_EXPLICIT_LIMIT` (real config: 4 for every B <= 8 with the packed int4 slots and
+    with the NVFP4 slots)."""
     for slots in range(moe.SLOTS, 2, -1):
-        total = vmem_budget(cfg, batch, tp, slots, aux_hidden, log=None, wire=wire, banks=banks)
+        total = vmem_budget(
+            cfg, batch, tp, slots, aux_hidden, log=None, wire=wire, banks=banks,
+            expert_format=expert_format,
+        )
         total = total["total"]
         if total <= VMEM_EXPLICIT_LIMIT:
             return slots
     return 2
 
 
-def default_geometry(cfg: Config, batch, tp=8, aux_hidden=False, wire=BF16):
+def default_geometry(cfg: Config, batch, tp=8, aux_hidden=False, wire=BF16, expert_format="int4"):
     """`(moe_slots, banks)`: the deepest ring in (12, 10, 8) that still fits `moe.SLOTS` expert
     slots, else 12 banks with as many slots as fit (`default_moe_slots`)."""
     for banks in (layout.BANKS, 10, 8):
-        slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, banks)
+        slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, banks, expert_format)
         if slots == moe.SLOTS:
             return slots, banks
-    return default_moe_slots(cfg, batch, tp, aux_hidden, wire, layout.BANKS), layout.BANKS
+    slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, layout.BANKS, expert_format)
+    return slots, layout.BANKS
 
 
 def vmem_budget(
     cfg: Config, batch, tp=8, moe_slots=None, aux_hidden=False, log=print, wire=BF16,
-    banks=layout.BANKS, hier=None,
+    banks=layout.BANKS, hier=None, expert_format="int4",
 ):
     """Explicit VMEM allocations of the kernel in bytes per group (+ `total`), printed via `log`.
 
@@ -285,8 +328,10 @@ def vmem_budget(
     compiler adds ~2.7 MiB of register spill slots on top (measured at real widths, B=8).
     """
     if moe_slots is None:
-        moe_slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, banks)
-    groups = scratch_shapes(cfg, batch, tp, moe_slots, aux_hidden, wire, banks, hier=hier)
+        moe_slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, banks, expert_format)
+    groups = scratch_shapes(
+        cfg, batch, tp, moe_slots, aux_hidden, wire, banks, hier=hier, expert_format=expert_format
+    )
     out = {name: _scratch_bytes(shapes) for name, shapes in groups.items()}
     vp = layout.vocab_pad(cfg, tp)
     out["logits_acc"] = _padded_bytes((LOGIT_ROWS, vp), F32)
@@ -299,7 +344,8 @@ def vmem_budget(
     if log is not None:
         parts = ", ".join(f"{k} {v / MIB:.2f}" for k, v in out.items() if k != "total")
         log(
-            f"decode megakernel VMEM budget (B={batch}, moe_slots={moe_slots}, banks={banks}): "
+            f"decode megakernel VMEM budget (B={batch}, {expert_format} experts, "
+            f"moe_slots={moe_slots}, banks={banks}): "
             f"{out['total'] / MIB:.2f} MiB of {VMEM_LIMIT / MIB:.0f} [{parts}]"
         )
     return out
@@ -373,15 +419,17 @@ def _kernel_body(cfg: Config, batch, tp, opts):
     L, H, Hm = cfg.layers, cfg.hidden, cfg.moe_hidden
     B = batch
     r16 = stream.r16
-    n_weights = len(WEIGHT_NAMES)
+    names = weight_names(opts.expert_format)
+    n_weights = len(names)
+    xp = _expert_module(opts.expert_format)
     groups = scratch_shapes(
         cfg, B, tp, opts.moe_slots, opts.aux_hidden, opts.wire, opts.banks,
-        packed=not opts.interpret, hier=opts.hier,
+        packed=not opts.interpret, hier=opts.hier, expert_format=opts.expert_format,
     )
     sizes = {name: len(shapes) for name, shapes in groups.items()}
 
     def body(pos_ref, x0_ref, rope_ref, final_norm_ref, *refs):
-        weights = dict(zip(WEIGHT_NAMES, refs[:n_weights]))
+        weights = dict(zip(names, refs[:n_weights]))
         refs = refs[n_weights:]
         k_in, v_in, logits_ref, tokens_ref, k_cache, v_cache = refs[:6]
         del k_in, v_in  # aliased to k_cache / v_cache
@@ -417,8 +465,8 @@ def _kernel_body(cfg: Config, batch, tp, opts):
 
         attn_ws = scratch["attention"]
         q_ref, kv_ref, g_ref = scratch["attention_io"]
-        sc = moe.MoeScratch.bind(scratch["moe"])
-        experts = moe.ExpertWeights(*(weights[n] for n in layout.EXPERT_FAMILIES))
+        sc = xp.bind(scratch["moe"])
+        experts = xp.weights(weights)
         vec = {}
         for i, name in enumerate(layout.VECTOR_FAMILIES):
             vec[name] = (weights[name], scratch["vectors"][2 * i], scratch["vectors"][2 * i + 1])
@@ -504,13 +552,15 @@ def _kernel_body(cfg: Config, batch, tp, opts):
                 idx, w = moe.route_from_logits(cfg, logits, v("router_bias", l))
             moe.route_to_scratch(cfg, sc, idx, w)
             if "experts" not in skip:
-                moe.start_expert_stream(cfg, l, experts, sc)
+                xp.start(cfg, l, experts, sc)
             h0 = all_gather(r16(h0), phase + 1)  # [B, Hm]
             h1 = stream.norm_to_bf16(h0, v("pre_expert_norm", l), cfg.rms_eps)
             if "experts" not in skip:
 
-                def after_wave(w, n_waves):
-                    target = 0 if opts.flush == "first" else n_waves - 1
+                def after_wave(w, n_waves=None):
+                    # n_waves is None for streams that only report the wave index (fp4):
+                    # flush after the first wave then.
+                    target = 0 if opts.flush == "first" or n_waves is None else n_waves - 1
                     if isinstance(w, int):  # static waves (B=1)
                         if w == target:
                             stream.flush_deferred(ring)
@@ -520,10 +570,8 @@ def _kernel_body(cfg: Config, batch, tp, opts):
                     def _flush():
                         stream.flush_deferred(ring)
 
-                moe.expert_stream(
-                    cfg, l, h1, experts, sc, started=True, after_wave=after_wave,
-                    compute="expert_dots" not in skip,
-                )
+                extra = {} if "expert_dots" not in skip else {"compute": False}
+                xp.stream(cfg, l, h1, experts, sc, started=True, after_wave=after_wave, **extra)
                 assert not ring.deferred  # flushed inside the wave loop (>= 1 wave per layer)
             else:
                 sc.y_out[...] = jnp.broadcast_to(h1[:1].astype(F32), sc.y_out.shape) * 0.01
@@ -562,19 +610,24 @@ def _kernel_body(cfg: Config, batch, tp, opts):
     return body, groups
 
 
-def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
+def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset(), expert_format="int4"):
     """Per-rank `kernel(pos, x0, rope, final_norm, weights, k_cache, v_cache) -> (logits [8, Vp]
     f32, tokens [8, 128] i32, k_cache, v_cache[, aux])` around the `pallas_call` (no
     shard_map; `weights` is the per-rank dict without the leading rank axis). Used by
     `make_decode`."""
     opts = parse_options(options)
-    layout.check_tp(cfg, tp)
+    opts.expert_format = expert_format
+    layout.check_tp(cfg, tp, expert_format)
     if opts.moe_slots is None and opts.banks is None:
-        opts.moe_slots, opts.banks = default_geometry(cfg, batch, tp, opts.aux_hidden, opts.wire)
+        opts.moe_slots, opts.banks = default_geometry(
+            cfg, batch, tp, opts.aux_hidden, opts.wire, expert_format
+        )
     elif opts.banks is None:
         opts.banks = layout.BANKS
     elif opts.moe_slots is None:
-        opts.moe_slots = default_moe_slots(cfg, batch, tp, opts.aux_hidden, opts.wire, opts.banks)
+        opts.moe_slots = default_moe_slots(
+            cfg, batch, tp, opts.aux_hidden, opts.wire, opts.banks, expert_format
+        )
     if opts.defer is None:
         opts.defer = "next" if batch <= 4 else "none"
     if opts.hier is None:
@@ -591,7 +644,8 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pl.ANY)
-    n_weights = len(WEIGHT_NAMES)
+    names = weight_names(expert_format)
+    n_weights = len(names)
     k_index = 4 + n_weights
     out_shape = [
         jax.ShapeDtypeStruct((LOGIT_ROWS, vp), F32),
@@ -618,7 +672,7 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
     def kernel(pos, x0, rope, final_norm, weights, k_cache, v_cache):
         if tuple(k_cache.shape) != cache_shape:
             raise ValueError(f"k_cache {k_cache.shape} != {cache_shape}")
-        args = [weights[name] for name in WEIGHT_NAMES]
+        args = [weights[name] for name in names]
         return call(pos, x0, rope, final_norm, *args, k_cache, v_cache)
 
     return kernel, opts
@@ -626,7 +680,7 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
 
 def make_decode(
     mesh, cfg: Config, context, batch, *, greedy=True, return_logits=False, tp=8,
-    options=frozenset(),
+    options=frozenset(), expert_format=None,
 ):
     """Jitted `decode(weights, caches, tokens [B] i32, pos [B] i32) -> (next_tokens [B] i32,
     logits [B, V] f32 or None, caches)` (design.md 5.6); `caches` are donated.
@@ -635,19 +689,34 @@ def make_decode(
     `return_logits`, or when `greedy=False`) are the softcapped full-vocabulary logits with
     ids `>= vocab_used` masked to -inf, for `sampling.sample`. With the `"aux_hidden"` option
     a fourth output `[L + 1, B, H]` (the f32 residual stream per layer) is appended.
+    `expert_format` ("int4" / "nvfp4", `layout.EXPERT_FORMATS`) selects the expert kernel;
+    None (default) infers it from the family names of `weights` at the first call
+    (`layout.expert_format_of`), so the same program serves both container formats.
     """
     if mesh.size != tp:
         raise ValueError(f"mesh has {mesh.size} devices, tp={tp}")
     options = frozenset(options)
     return_logits = return_logits or not greedy
-    kernel, opts = make_kernel(cfg, context, batch, tp=tp, options=options)
     vp = layout.vocab_pad(cfg, tp)
-    vmem_budget(
-        cfg, batch, tp, opts.moe_slots, opts.aux_hidden, wire=opts.wire, banks=opts.banks,
-        hier=opts.hier,
-    )
+    built = {}
+
+    def kernel_for(fmt):
+        if fmt not in built:
+            kernel, opts = make_kernel(cfg, context, batch, tp=tp, options=options, expert_format=fmt)
+            vmem_budget(
+                cfg, batch, tp, opts.moe_slots, opts.aux_hidden, wire=opts.wire,
+                banks=opts.banks, hier=opts.hier, expert_format=fmt,
+            )
+            built[fmt] = (kernel, opts)
+        return built[fmt]
+
+    if expert_format is not None:
+        kernel_for(expert_format)
+    aux_hidden = parse_options(options).aux_hidden
 
     def local(weights, caches, tokens, pos):
+        fmt = expert_format or layout.expert_format_of(weights)
+        kernel, opts = kernel_for(fmt)
         w = {name: value[0] for name, value in weights.items()}
         kc, vc = caches["k_cache"][0], caches["v_cache"][0]
         rank = lax.axis_index("tp")
@@ -674,7 +743,7 @@ def make_decode(
         w_specs = {name: P("tp") for name in weights}
         c_specs = {name: P("tp") for name in caches}
         out_specs = (P(), P() if return_logits else None, c_specs)
-        if opts.aux_hidden:
+        if aux_hidden:
             out_specs += (P(),)
         return jax.shard_map(
             local,
@@ -690,6 +759,7 @@ def make_decode(
 __all__ = [
     "COLLECTIVE_ID",
     "WEIGHT_NAMES",
+    "weight_names",
     "make_decode",
     "make_kernel",
     "parse_options",

@@ -58,14 +58,14 @@ MIB = float(1 << 20)
 # --------------------------------------------------------------------------------------
 # HBM floor
 # --------------------------------------------------------------------------------------
-def hbm_floor_ms(cfg, batch, tp=TP):
+def hbm_floor_ms(cfg, batch, tp=TP, expert_format="int4"):
     """Bytes one core must read per decode step and the implied floor in ms.
 
     Dense per layer (bf16, per rank): q, kv, gate, o, pre, post, router hi/lo; experts: the
     routed experts' int4 gate_up + down with their scales, at most `top_k * batch` distinct
     (the upper bound, so the floor at B > 1 is slightly pessimistic); lm_head per rank.
     """
-    shapes = layout.rank_shapes(cfg, tp)
+    shapes = layout.rank_shapes(cfg, tp, expert_format)
 
     def nbytes(name):
         shape, dtype = shapes[name]
@@ -73,7 +73,8 @@ def hbm_floor_ms(cfg, batch, tp=TP):
         return int(np.prod(shape)) * item
 
     dense = sum(nbytes(n) for n in layout.STREAMED_FAMILIES if n != "lm_head")  # all layers
-    per_expert = sum(nbytes(n) for n in layout.EXPERT_FAMILIES) / (cfg.layers * cfg.experts)
+    families = layout.expert_families(expert_format)
+    per_expert = sum(nbytes(n) for n in families) / (cfg.layers * cfg.experts)
     experts = per_expert * min(cfg.top_k * batch, cfg.experts) * cfg.layers
     lm_head = nbytes("lm_head")
     total = dense + experts + lm_head
@@ -102,9 +103,11 @@ class Harness:
         self.mesh = jax.sharding.Mesh(np.asarray(devices[:TP]), ("tp",))
         self.doc = ms_load.read_layout(args.weights)
         self.cfg = ms_load.config_from_layout(self.doc)
+        self.expert_format = ms_load.layout_expert_format(self.doc)
         self.tokenizer = ms_load.load_tokenizer(args.checkpoint)
         self.prompts = self.load_prompts()
-        log(f"loading weights from {args.weights} ({self.doc['total_bytes'] / 1e9:.0f} GB)")
+        log(f"loading weights from {args.weights} ({self.doc['total_bytes'] / 1e9:.0f} GB, "
+            f"{self.expert_format} experts)")
         t0 = time.perf_counter()
         self.weights = ms_load.load_presharded(self.mesh, args.weights, self.cfg, log=lambda _: None)
         self.load_seconds = time.perf_counter() - t0
@@ -152,7 +155,7 @@ class Harness:
             self.log(f"building decode program B={batch} logits={return_logits} aux={aux}")
             self.decoders[key] = dk.make_decode(
                 self.mesh, self.cfg, self.context, batch, greedy=True,
-                return_logits=return_logits, options=options,
+                return_logits=return_logits, options=options, expert_format=self.expert_format,
             )
         return self.decoders[key]
 
@@ -498,7 +501,7 @@ def task_bench(h: Harness):
         ms = 1e3 * seconds / steps
         best_ms = 1e3 * min(per_call) / args.steps_per_call
         worst_ms = 1e3 * max(per_call) / args.steps_per_call
-        floor = hbm_floor_ms(cfg, batch)
+        floor = hbm_floor_ms(cfg, batch, expert_format=h.expert_format)
         row = {
             "batch": batch,
             "steps": steps,
