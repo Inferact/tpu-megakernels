@@ -112,7 +112,9 @@ def sample(logits, key, temperature=DEFAULT_TEMPERATURE, top_k=DEFAULT_TOP_K, to
     k = vocab if not top_k else min(int(top_k), vocab)
     temperature = jnp.asarray(temperature, F32)
     top_p = jnp.asarray(top_p, F32)
-    scaled = logits / jnp.maximum(temperature, jnp.finfo(F32).tiny)
+    # temperature 0 selects the argmax below; dividing by `tiny` there would saturate to inf
+    # and break the top-k tie order, so the scaling is bypassed instead.
+    scaled = jnp.where(temperature > 0, logits / jnp.maximum(temperature, jnp.finfo(F32).tiny), logits)
     values, ids = lax.top_k(scaled, k)  # descending, ties -> lower index
     probs = jax.nn.softmax(values, axis=-1)
     cumulative = jnp.cumsum(probs, axis=-1)
