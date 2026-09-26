@@ -195,3 +195,21 @@ With the checkpoint's generation_config sampling (temperature 1.0, top_k 64, top
 
 **Side finding (bug, not in my files):** `musespark.sampling.sample` is wrong for `temperature == 0` requests on a server started in sampling mode (`--temperature 1.0`): `scaled = logits / jnp.maximum(temperature, float32.tiny)` overflows every softcapped logit above ~4 to `+inf`, `lax.top_k` then ties at `inf` and the "greedy" branch (`choice = 0`) picks the lowest token id among them, so the request returns `! " # $ %` garbage (ids 0-5) until the budget. Reproduced on CPU: `sample(logits, key, 0.0, 64, 1.0)` = 0 while `argmax` = 22988 and `sample(..., 1e-3, ...)` = 22988. The sampled-run smoke test (temperature 0.0 in the request) shows it (`smoke.json`: 1024 tokens of `%!#$`); the lm-eval requests (temperature 1.0) are unaffected. Fix: `scaled = jnp.where(temperature > 0, logits / jnp.maximum(temperature, tiny), logits)` (or clamp at, say, 1e-4).
 
+
+## Final confirmation (tip 9030151 code, NVFP4 experts + int8 dense projections / lm_head, first 200 test problems)
+
+`gsm8k_cot_llama`, 8-shot, chat template, reasoning effort medium, max_gen_toks 8192, `/filestore/weights/muse-spark-tp8-nvfp4` with its layout.json default `dense_format: int8`.
+
+| decoding | flexible | strict | empties / budget hits | trunc/extr/arith/read | gen tokens mean / median / max | decode tok/s (server, B=1) | ms/step | run directory |
+|---|---|---|---|---|---|---|---|---|
+| greedy | 95.5% (191/200) | 97.5% | 0 / 0 | 0/8/1/0 | 698 / 656 / 2396 | 292.3 (139671 tok / 478 s) | 3.27 | `gsm8k-musespark-200-nvfp4-8192-medium-llama-20260926T084027Z` |
+| vendor sampling (T=1.0, top_k 64, top_p 1, seed 0) | 97.5% (195/200) | 97.5% | 0 / 0 | 0/3/1/1 | 595 / 552 / 2012 | 282.2 (118918 tok / 421 s) | 3.38 | `gsm8k-musespark-200-nvfp4-8192-medium-llama-t1.0k64p1.0-20260926T085135Z` |
+
+- greedy: misses doc 12 (arithmetic, gold 13, got 12); doc 37 (extraction, gold 2, got 0); doc 45 (extraction, gold 104, got 44); doc 93 (extraction, gold 36, got 36.36); doc 119 (extraction, gold 95200, got 0.7); doc 147 (extraction, gold 75, got 30); doc 161 (extraction, gold 32, got 8); doc 184 (extraction, gold 25, got 100); doc 187 (extraction, gold 106, got $106.12)
+- vendor sampling (T=1.0, top_k 64, top_p 1, seed 0): misses doc 12 (extraction, gold 13, got 12); doc 37 (arithmetic, gold 2, got 0); doc 119 (extraction, gold 95200, got 0.70); doc 161 (reading, gold 32, got 8); doc 184 (extraction, gold 25, got 100)
+First-100 subsets (comparable with the table above): greedy: 96% / 97%; vendor sampling (T=1.0, top_k 64, top_p 1, seed 0): 98% / 98%.
+
+All 9 greedy flexible-extract misses are hedged multi-number final answers ("The final answer is 32 total sea creatures, 17 fish biologically, 8 clownfish strictly", "... is 25% (50% vs 25%, i.e. 100% more likely)", "... is 0" after deriving 2 on the intended reading): the gold number is in the answer text in 8/9 and the strict regex (first number after the phrase) still scores 4 of them, which is why strict (97.5%) is above flexible (95.5%). Sampling hedges less (5 misses) and is again free of loops (max 2012 tokens, repeated-5-gram rate 0.000). No transcript in either run hit the budget or looped.
+
+Note: the script's smoke request (plain "Q: ... A:" prompt, no terminal-phrase instruction, greedy, 1024-token cap) loops on the int8-dense path (reaches "16 loaves" in the first 100 tokens, then the "We should answer / provide final answer" cycle) where the bf16-dense path stopped at 333 tokens: int8 dense perturbs the greedy trajectory like int4 vs NVFP4 did, and the plain prompt remains loop-prone under argmax. The llama-format eval requests are unaffected (see the budget-hit column).
+
