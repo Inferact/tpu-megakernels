@@ -57,7 +57,8 @@ REF = Path(os.environ.get("MUSESPARK_REAL_REF", M.V.DEFAULT_OUT))
 # 10%. The NVFP4 container with int8 dense projections (`dense_format: int8`) trips a routing
 # near-tie on prompt 0 (top-8 flips at layers 9 and 59 between the kernel and the XLA prefill,
 # both running the same int8 maths): measured 9.8 logits / 16% relative RMS while the argmax
-# and 4/5 of the top-5 still agree and `ring=plain` reproduces the excursion to 2.8e-7, so the
+# still agrees (top-5 overlap 2/5, mean |diff| 2.4) and the plain and block-diagonal rings agree
+# with each other to 2.8e-7, so the
 # bounds below are the documented envelope for that container, not a kernel tolerance.
 def _bounds():
     import json
