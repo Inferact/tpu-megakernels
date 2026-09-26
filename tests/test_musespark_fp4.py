@@ -394,11 +394,12 @@ def test_expert_slot_dots_in_kernel(converted, batch):
     rng = _rng(batch)
     h1 = rng.standard_normal((batch, MINI.moe_hidden)).astype(ml_dtypes.bfloat16).astype(np.float32)
 
-    scratch = fp4.scratch_shapes(MINI, batch, TP, slots=1)[5:8]  # h_bd, gu_sd, dn_sd
+    scratch = fp4.scratch_shapes(MINI, batch, TP, slots=1)[5:9]  # h_bd, hc_bd, gu_sd, dn_sd
 
-    def kernel(h_ref, gu_ref, gbs_ref, dn_ref, dbs_ref, gs_ref, gu_out, y_out, h_bd, gu_sd, dn_sd):
-        sc = fp4.Fp4Scratch(gu_ref, gbs_ref, dn_ref, dbs_ref, gs_ref, h_bd, gu_sd, dn_sd,
-                            *([None] * 7))
+    def kernel(h_ref, gu_ref, gbs_ref, dn_ref, dbs_ref, gs_ref, gu_out, y_out, h_bd, hc_bd, gu_sd,
+               dn_sd):
+        sc = fp4.Fp4Scratch(gu_ref, gbs_ref, dn_ref, dbs_ref, gs_ref, h_bd, hc_bd, gu_sd, dn_sd,
+                            *([None] * 8))
         h = h_ref[...]
         if not fp4.use_dequant(batch):
             fp4.block_diag16_to_ref(h_bd, h)
@@ -630,21 +631,27 @@ def _routes(cfg, batch, rng, distinct=None):
     return idx.astype(np.int32), w / w.sum(1, keepdims=True)
 
 
-STREAM_CASES = [(MINI, 1, None, 8), (MINI, 2, None, 8), (MINI, 4, None, 8), (MINI, 4, None, 4),
-                (MINI, 8, 4, 8), (MINI, 8, None, 8), (MINI, 8, None, 9),
-                (Config(layers=2, experts=16), 1, None, 8), (Config(layers=2, experts=16), 8, None, 8),
-                (Config(layers=2, experts=16), 4, None, 8)]
+STREAM_CASES = [(MINI, 1, None, 8, 2), (MINI, 2, None, 8, 2), (MINI, 4, None, 8, 2),
+                (MINI, 4, None, 4, 2), (MINI, 4, None, 8, 0), (MINI, 8, 4, 8, 2), (MINI, 8, None, 8, 2),
+                (MINI, 8, None, 9, 2), (MINI, 8, None, 8, 0), (MINI, 8, None, 8, 1),
+                (Config(layers=2, experts=16), 1, None, 8, 2),
+                (Config(layers=2, experts=16), 8, None, 8, 2),
+                (Config(layers=2, experts=16), 4, None, 8, 2)]
 
 
-@pytest.mark.parametrize("cfg,batch,distinct,min_batch", STREAM_CASES,
-                         ids=["mini-b1", "mini-b2", "mini-b4", "mini-b4-dequant", "mini-b8-4experts",
-                              "mini-b8", "mini-b8-blockdiag", "real-b1", "real-b8", "real-b4"])
-def test_fp4_expert_stream_matches_reference(cfg, batch, distinct, min_batch, monkeypatch):
+@pytest.mark.parametrize("cfg,batch,distinct,min_batch,compact_rows", STREAM_CASES,
+                         ids=["mini-b1", "mini-b2", "mini-b4", "mini-b4-dequant", "mini-b4-nocompact",
+                              "mini-b8-4experts", "mini-b8", "mini-b8-blockdiag", "mini-b8-nocompact",
+                              "mini-b8-compact1", "real-b1", "real-b8", "real-b4"])
+def test_fp4_expert_stream_matches_reference(cfg, batch, distinct, min_batch, compact_rows,
+                                             monkeypatch):
     """`min_batch` (patched `fp4.DEQUANT_MIN_BATCH`) selects the dot formulation: 8 = the
-    default (block-diagonal below B=8, dequant at 8), 4 / 9 force the other one."""
+    default (block-diagonal below B=8, dequant at 8), 4 / 9 force the other one;
+    `compact_rows` patches `fp4.COMPACT_ROWS` (2 = default, 0 = off)."""
     if INTERPRET and cfg.moe_hidden > MINI.moe_hidden and batch > 1:
         pytest.skip("real-width B>1 streams are slow in interpret mode")
     monkeypatch.setattr(fp4, "DEQUANT_MIN_BATCH", min_batch)
+    monkeypatch.setattr(fp4, "COMPACT_ROWS", compact_rows)
     rng = _rng(batch * 3 + (distinct or 0))
     weights, gate_up, down = random_fp4_expert_weights(cfg, seed=batch)
     idx, w = _routes(cfg, batch, rng, distinct)

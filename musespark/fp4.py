@@ -72,7 +72,9 @@ SLOTS = 4  # expert slots (2 in compute, 2 in flight), like moe.SLOTS
 COPIES = 5  # DMAs per expert: gate_up_fp4, gate_up_bs, down_fp4, down_bs, expert_gs
 GS_ROWS, GS_LANES = 8, 128
 WAVE_ROWS = 3  # SMEM wave_ids ring: waves w, w+1, w+2 (by w % 3)
+STATS_RING = 4  # SMEM route-stats ring over stream positions e-1, e, e+1 (by e % 4)
 DEQUANT_MIN_BATCH = 8  # batch from which the bf16 VPU-dequant dot replaces the block-diagonal dot
+COMPACT_ROWS = 2  # B > COMPACT_ROWS: experts with <= this many active rows use a compact LHS (0: off)
 SUBLANES = 8  # f32 sublanes per vreg (stride-0 broadcast loads)
 
 
@@ -92,6 +94,11 @@ def _interpret():
 def use_dequant(batch):
     """Static choice of the dot formulation for `batch` rows (`DEQUANT_MIN_BATCH`)."""
     return batch >= DEQUANT_MIN_BATCH
+
+
+def use_compact(batch):
+    """Static: does the `batch`-row stream carry the compact path (`COMPACT_ROWS` active rows)?"""
+    return 0 < COMPACT_ROWS < batch
 
 
 # ---------------------------------------------------------------------------------------------
@@ -260,6 +267,7 @@ class Fp4Scratch:
     down_bs: object  # [SLOTS, Is/KC', KC'/16, Hm] e4m3
     expert_gs: object  # [SLOTS, 8, 128] f32
     h_bd: object  # block-diag path: [Hm/KC, B*32, KC] bf16 expansion of h1; dequant path: [1, 8, 128]
+    hc_bd: object  # compact path: [Hm/KC, COMPACT_ROWS*32, KC] bf16 expansion of an expert's active rows
     gu_sd: object  # dequant path: [Hm/16, 2*Is] int32 scale words of the gate_up slot in compute
     dn_sd: object  # dequant path: [Is/16, Hm] int32 scale words of the down slot in compute
     gu_buf: object  # [SLOTS, B, 2*Is] f32: gate_up results handed from slot s to the down of s
@@ -268,6 +276,7 @@ class Fp4Scratch:
     done: object  # [MR, 128] int32
     y_out: object  # [K*B, Hm] f32
     wave_ids: object  # SMEM [WAVE_ROWS, SLOTS] int32
+    stats: object  # SMEM [STATS_RING, 1 + COMPACT_ROWS] int32: active rows, compact row ids
     sems: object  # DMA semaphores [SLOTS, COPIES]
 
     @classmethod
@@ -290,7 +299,8 @@ def slot_shapes(cfg: Config, tp=8, slots=SLOTS):
 
 def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
     """Scratch tuple for `Fp4Scratch.bind` (real config: 12 MiB fp4 slots + 1.5 MiB e4m3 scales
-    + B*0.25 MiB block-diagonal buffer (B <= 4) or 1.5 MiB scale words (B = 8) + 1 MiB y_out)."""
+    + B*0.25 MiB block-diagonal buffer (B <= 4) or 1.5 MiB scale words (B = 8) + 0.5 MiB compact
+    block-diagonal buffer (B > COMPACT_ROWS) + 1 MiB y_out)."""
     if batch > MR:
         raise ValueError(f"batch {batch} exceeds the MXU row block {MR}")
     Hm, Is = cfg.moe_hidden, cfg.expert_hidden // tp
@@ -298,6 +308,7 @@ def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
     tiny = (1, SUBLANES, LANES)
     return tuple(pltpu.VMEM(shape, dtype) for shape, dtype in slot_shapes(cfg, tp, slots).values()) + (
         pltpu.VMEM(tiny if dequant else block_diag16_shape(Hm, batch), BF16),
+        pltpu.VMEM(block_diag16_shape(Hm, COMPACT_ROWS) if use_compact(batch) else tiny, BF16),
         pltpu.VMEM((Hm // BLOCK, 2 * Is) if dequant else tiny, I32),
         pltpu.VMEM((Is // BLOCK, Hm) if dequant else tiny, I32),
         pltpu.VMEM((slots, batch, 2 * Is), F32),
@@ -306,6 +317,7 @@ def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
         pltpu.VMEM((MR, LANES), I32),
         pltpu.VMEM((cfg.top_k * batch, Hm), F32),
         pltpu.SMEM((WAVE_ROWS, slots), I32),
+        pltpu.SMEM((STATS_RING, 1 + max(COMPACT_ROWS, 1)), I32),
         pltpu.SemaphoreType.DMA((slots, COPIES)),
     )
 
@@ -313,7 +325,7 @@ def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
 def scratch_bytes(cfg: Config, batch, tp=8, slots=SLOTS):
     """VMEM bytes of `scratch_shapes`."""
     total = 0
-    for s in scratch_shapes(cfg, batch, tp, slots)[:-2]:
+    for s in scratch_shapes(cfg, batch, tp, slots)[:-3]:
         n = 1
         for d in s.shape:
             n *= d
@@ -374,6 +386,19 @@ def down_dot(sc: Fp4Scratch, slot, a):
 
 def _batch_of(cfg: Config, sc: Fp4Scratch):
     return sc.y_out.shape[0] // cfg.top_k
+
+
+def route_stats(consumed):
+    """`consumed [MR, LANES]` route mask of one expert -> `(active row count, [first active
+    row, second, ...])` scalars (`COMPACT_ROWS` ids; `MR` when there is no such row)."""
+    row_b = _iota((MR, 1), 0)
+    act = jnp.max(consumed.astype(I32), axis=1, keepdims=True) > 0  # [MR, 1]
+    ids, after = [], jnp.full((MR, 1), False)
+    for _ in range(max(COMPACT_ROWS, 1)):
+        b = jnp.min(jnp.where(act & ~after, row_b, MR))
+        ids.append(b)
+        after = after | (row_b <= b)
+    return jnp.sum(act.astype(I32)), ids
 
 
 def _mark(sc: Fp4Scratch, picks):
@@ -509,26 +534,124 @@ def expert_stream(cfg: Config, layer, h1, weights: Fp4ExpertWeights, sc: Fp4Scra
         for t in range(slots):
             sc.wave_ids[row, t] = ahead[t].expert
 
-    # One expert per iteration: gate_up(e) (MXU) ahead of down(e - 1) in one basic block (two
-    # slots in compute, two in flight); iteration 0's down(-1) is a masked dummy. (Two experts
-    # per iteration measured slower: 15.8 / 21.6 / 20.4 vs 14.4 / 20.8 / 18.2 us per layer at
-    # B = 2 / 4 / 8, also with 6 slots.)
-    @pl.loop(0, n)
-    def _step(e):
-        slot = e % slots
-        prev = jnp.maximum(e - 1, 0)  # expert e - 1 (a masked dummy at e = 0)
-        pslot = (e + slots - 1) % slots
-        if dma:
-            wait_copies(expert_copies(weights, sc, layer, 0, slot))
-        sc.gu_buf[slot] = gate_up_dot(sc, slot, h1) if compute else gate_up(slot)
-        finish(id_at(prev), pslot, e >= 1)
-        refill(prev, pslot, e >= 1)
+    R = COMPACT_ROWS
+    row_b = _iota((MR, 1), 0)
 
-        @pl.when(slot == 0)
-        def _select():
-            select_ahead(e)
+    def routes(expert, live):
+        """`[MR, LANES]` mask of the routes of `expert` (`live`: scalar, False for the dummy)."""
+        return valid & (idx_tile == expert) & live
 
-    finish(id_at(n - 1), (n - 1) % slots, True)
+    def store_stats(e):
+        """`route_stats` of stream position `e` -> `sc.stats[e % STATS_RING]` (computed one
+        iteration ahead, inside the main block, so the reductions overlap the MXU work)."""
+        count, ids = route_stats(routes(id_at(e), True))
+        sc.stats[e % STATS_RING, 0] = count
+        for r, b in enumerate(ids):
+            sc.stats[e % STATS_RING, 1 + r] = b
+
+    def stats_at(e):
+        """`(active row count, [picked [MR, 1] masks: row b is compact row r])` of stream
+        position `e` from the SMEM ring."""
+        count = sc.stats[e % STATS_RING, 0]
+        picked = [row_b == sc.stats[e % STATS_RING, 1 + r] for r in range(R)]
+        return count, picked
+
+    def compact_gate_up(slot, picked):
+        """gate_up of the expert in `slot` on its <= R active rows (`sc.hc_bd`): rows 0..R-1
+        of `sc.gu_buf[slot]`."""
+        hc = jnp.concatenate(
+            [jnp.sum(jnp.where(p[0:B], h1.astype(F32), F32(0)), axis=0, keepdims=True) for p in picked],
+            0,
+        )
+        block_diag16_to_ref(sc.hc_bd, hc)
+        gu = fp4_block_dot(sc.hc_bd, sc.gate_up_fp4.at[slot], sc.gate_up_bs.at[slot], R)
+        sc.gu_buf[slot, 0:R, :] = apply_gate_up_gs(gu, sc.expert_gs[slot], Is)
+
+    def compact_finish(slot, consumed, picked):
+        """Down projection of the compact rows of `slot`, scattered back to the batch rows."""
+        yc = down(slot, sc.gu_buf[slot, 0:R, :])  # [R, Hm]
+        y = None
+        for r, p in enumerate(picked):
+            term = jnp.where(p[0:B], yc[r : r + 1, :], F32(0))  # [B, Hm]
+            y = term if y is None else y + term
+        moe._store_rows(sc, y, consumed, B, K)
+
+    def gate_up_of(e, slot, compact):
+        if not compact:
+            sc.gu_buf[slot] = gate_up_dot(sc, slot, h1) if compute else gate_up(slot)
+            return
+        count, picked = stats_at(e)
+
+        @pl.when(count <= R)
+        def _compact():
+            compact_gate_up(slot, picked)
+
+        @pl.when(count > R)
+        def _full():
+            sc.gu_buf[slot] = gate_up_dot(sc, slot, h1)
+
+    def finish_of(e, slot, live, compact):
+        expert = id_at(e)
+        if not compact:
+            finish(expert, slot, live)
+            return
+        count, picked = stats_at(e)
+
+        @pl.when(count <= R)
+        def _compact():
+            compact_finish(slot, routes(expert, live), picked)
+
+        @pl.when(count > R)
+        def _full():
+            finish(expert, slot, live)
+
+    def run_loop(compact):
+        """One expert per iteration: gate_up(e) (MXU) ahead of down(e - 1) in one basic block
+        (two slots in compute, two in flight); iteration 0's down(-1) is a masked dummy. (Two
+        experts per iteration measured slower: 15.8 / 21.6 / 20.4 vs 14.4 / 20.8 / 18.2 us per
+        layer at B = 2 / 4 / 8, also with 6 slots.) `compact`: every expert with <= COMPACT_ROWS
+        active rows runs the block-diagonal dots on a compact `[COMPACT_ROWS, Hm]` LHS (64 MXU
+        rows) instead of the full-batch formulation; the per-expert route stats are computed
+        one expert ahead into the SMEM ring."""
+        if compact:
+            store_stats(0)
+
+        @pl.loop(0, n)
+        def _step(e):
+            slot = e % slots
+            prev = jnp.maximum(e - 1, 0)  # expert e - 1 (a masked dummy at e = 0)
+            pslot = (e + slots - 1) % slots
+            if dma:
+                wait_copies(expert_copies(weights, sc, layer, 0, slot))
+            gate_up_of(e, slot, compact)
+            finish_of(prev, pslot, e >= 1, compact)
+            refill(prev, pslot, e >= 1)
+            if compact:
+                store_stats(e + 1)  # position n reads a sentinel / stale id: never consumed
+
+            @pl.when(slot == 0)
+            def _select():
+                select_ahead(e)
+
+        finish_of(n - 1, (n - 1) % slots, True, compact)
+
+    if use_compact(B) and compute:
+        # The compact loop pays ~0.25 us per expert for its conditional blocks and wins ~0.7 us
+        # per expert with <= COMPACT_ROWS active rows: take it when the mean active rows per
+        # expert (B*K / n) is <= 3, i.e. for genuinely different rows (measured L=8: distinct
+        # rows B=4 / 8: 52.8 -> 41.9, 72.2 -> 56.8 us per layer; identical rows unchanged).
+        many = 3 * n >= B * K
+
+        @pl.when(many)
+        def _compact_loop():
+            run_loop(True)
+
+        @pl.when(~many)
+        def _plain_loop():
+            run_loop(False)
+    else:
+        run_loop(False)
+
     if after_wave is not None:
         after_wave(0)
 
