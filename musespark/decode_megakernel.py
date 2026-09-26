@@ -15,8 +15,10 @@ leading rank axis is stripped and (design.md section 4):
    `s0 = r16(rms(row))`, the RoPE table of the step (`attention.rope_table`).
 2. The kernel (below): every layer, the final norm and the lm_head, writing the raw logits
    shard `[8, Vp]` f32 (rows `>= B` are padding) and the caches.
-3. XLA glue: `sampling.greedy_local` (ids `>= vocab_used` and the pad columns masked) and,
-   with `return_logits`, `sampling.gather_logits_local` (softcapped full logits).
+3. Greedy tokens in-kernel (`_greedy_tokens`: per-rank masked `(max, argmax)`, one all-gather
+   of the 8 pairs, lowest id among the maxima -- the semantics of `sampling.greedy_local`)
+   written as `[8, 128]` int32 (lane 0); with `return_logits` the XLA glue also gathers
+   `sampling.gather_logits_local` (softcapped full logits).
 
 Kernel body (per rank; `l` is a `lax.fori_loop` index, the layer kind is arithmetic):
 
@@ -75,7 +77,8 @@ Payload rows of the collectives are padded to 8 (`stream.mxu_rows`); payloads na
                        `collectives` (all-reduce -> identity, all-gather -> local tile),
                        `attention` (o := q, no cache traffic), `experts` (no expert DMAs/dots),
                        `route` (static experts 0..K-1), `lm_head` (ring ends after the last
-                       layer, logits unwritten), `dense_dots` (ring DMAs only, no MXU work)
+                       layer, logits unwritten), `dense_dots` (ring DMAs only, no MXU work),
+                       `expert_dots` (expert DMAs only)
 
 Run TPU programs with `XLA_FLAGS=--xla_allow_excess_precision=false` so the glue's `r16`
 (`lax.reduce_precision`) and the reference agree bit for bit.
@@ -101,6 +104,7 @@ I32 = jnp.int32
 MIB = 1 << 20
 COLLECTIVE_ID = 37
 COLLECTIVES_PER_LAYER = 4  # o-proj all-reduce, pre all-gather, expert all-reduce, post all-gather
+TOKEN_LANES = 128  # tokens output tile [LOGIT_ROWS, TOKEN_LANES] int32, token of row b in lane 0
 VMEM_LIMIT = 64 << 20
 LOGIT_ROWS = moe.MR  # 8: rows of the lm_head accumulator (the MXU row block)
 
@@ -150,7 +154,7 @@ def parse_options(options):
 
 
 SKIPPABLE = frozenset(
-    {"collectives", "attention", "experts", "route", "lm_head", "dense_dots"}
+    {"collectives", "attention", "experts", "route", "lm_head", "dense_dots", "expert_dots"}
 )
 
 
@@ -199,9 +203,11 @@ def _collective_geometry(cfg: Config, batch, tp):
 
 
 def scratch_shapes(
-    cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=False, wire=BF16, banks=layout.BANKS
+    cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=False, wire=BF16,
+    banks=layout.BANKS, packed=True,
 ):
-    """The kernel's scratch, grouped: `{group: tuple of pltpu.VMEM / semaphores}` in order."""
+    """The kernel's scratch, grouped: `{group: tuple of pltpu.VMEM / semaphores}` in order.
+    `packed=False` (interpret mode) uses plain int4 expert slots."""
     rows, width, gather_width = _collective_geometry(cfg, batch, tp)
     hq, hkv, D = cfg.heads // tp, cfg.kv_heads // tp, cfg.head_dim
     vectors = []
@@ -221,7 +227,7 @@ def scratch_shapes(
             pltpu.VMEM((batch, 2 * hkv * D), F32),
             pltpu.VMEM((batch, hq * D), F32),
         ),
-        "moe": moe.scratch_shapes(cfg, batch, tp, moe_slots),
+        "moe": moe.scratch_shapes(cfg, batch, tp, moe_slots, packed),
         "vectors": tuple(vectors),
         "activations": (
             pltpu.VMEM((batch, cfg.hidden), F32),  # residual stream s
@@ -326,21 +332,47 @@ def _all_gather_bf16(x, ws, phase):
     return y[:rows].astype(F32)
 
 
+def _greedy_tokens(cfg: Config, logits_ref, ws, phase, tp):
+    """Greedy token per row of the raw logits shard `[8, Vp]` (ids `>= vocab_used` masked):
+    every rank gathers the 8 `(max, argmax)` pairs and takes the lowest id holding the global
+    maximum (identical on every rank, ties -> lowest id). Returns `[8, TOKEN_LANES]` int32."""
+    rank = lax.axis_index(collectives.AXIS)
+    rows, vp = logits_ref.shape
+    col = lax.broadcasted_iota(I32, (rows, vp), 1)
+    gid = col + rank * vp
+    masked = jnp.where(gid < cfg.vocab_used, logits_ref[...], -jnp.inf)
+    local_max = jnp.max(masked, axis=1, keepdims=True)  # [rows, 1]
+    local_id = jnp.min(jnp.where(masked == local_max, gid, I32(2**30)), axis=1, keepdims=True)
+    lane = lax.broadcasted_iota(I32, (rows, TOKEN_LANES), 1)
+    pair = jnp.where(lane == 0, local_max, jnp.where(lane == 1, local_id.astype(F32), 0.0))
+    gathered = collectives.all_gather_rows(pair, ws, phase)  # [rows, tp*128]
+    maxima = jnp.concatenate([gathered[:, r * TOKEN_LANES : r * TOKEN_LANES + 1] for r in range(tp)], 1)
+    ids = jnp.concatenate(
+        [gathered[:, r * TOKEN_LANES + 1 : r * TOKEN_LANES + 2] for r in range(tp)], 1
+    ).astype(I32)
+    best = jnp.max(maxima, axis=1, keepdims=True)
+    token = jnp.min(jnp.where(maxima == best, ids, I32(2**30)), axis=1, keepdims=True)
+    return jnp.broadcast_to(token, (rows, TOKEN_LANES))
+
+
 def _kernel_body(cfg: Config, batch, tp, opts):
     """Build the `pallas_call` body closure for `cfg`/`batch`."""
     L, H, Hm = cfg.layers, cfg.hidden, cfg.moe_hidden
     B = batch
     r16 = stream.r16
     n_weights = len(WEIGHT_NAMES)
-    groups = scratch_shapes(cfg, B, tp, opts.moe_slots, opts.aux_hidden, opts.wire, opts.banks)
+    groups = scratch_shapes(
+        cfg, B, tp, opts.moe_slots, opts.aux_hidden, opts.wire, opts.banks,
+        packed=not opts.interpret,
+    )
     sizes = {name: len(shapes) for name, shapes in groups.items()}
 
     def body(pos_ref, x0_ref, rope_ref, final_norm_ref, *refs):
         weights = dict(zip(WEIGHT_NAMES, refs[:n_weights]))
         refs = refs[n_weights:]
-        k_in, v_in, logits_ref, k_cache, v_cache = refs[:5]
+        k_in, v_in, logits_ref, tokens_ref, k_cache, v_cache = refs[:6]
         del k_in, v_in  # aliased to k_cache / v_cache
-        refs = refs[5:]
+        refs = refs[6:]
         aux_ref = None
         if opts.aux_hidden:
             aux_ref, refs = refs[0], refs[1:]
@@ -463,11 +495,20 @@ def _kernel_body(cfg: Config, batch, tp, opts):
             if "experts" not in skip:
 
                 def after_wave(w, n_waves):
-                    @pl.when(w == (0 if opts.flush == "first" else n_waves - 1))
+                    target = 0 if opts.flush == "first" else n_waves - 1
+                    if isinstance(w, int):  # static waves (B=1)
+                        if w == target:
+                            stream.flush_deferred(ring)
+                        return
+
+                    @pl.when(w == target)
                     def _flush():
                         stream.flush_deferred(ring)
 
-                moe.expert_stream(cfg, l, h1, experts, sc, started=True, after_wave=after_wave)
+                moe.expert_stream(
+                    cfg, l, h1, experts, sc, started=True, after_wave=after_wave,
+                    compute="expert_dots" not in skip,
+                )
                 assert not ring.deferred  # flushed inside the wave loop (>= 1 wave per layer)
             else:
                 sc.y_out[...] = jnp.broadcast_to(h1[:1].astype(F32), sc.y_out.shape) * 0.01
@@ -498,14 +539,19 @@ def _kernel_body(cfg: Config, batch, tp, opts):
             logits_ref[:, pl.ds(0, H)] = jnp.broadcast_to(hN.astype(F32)[:1], (LOGIT_ROWS, H))
         else:
             gemv(hN, "lm_head", L, acc=logits_ref)
+        if "collectives" in skip:
+            tokens_ref[...] = jnp.zeros((LOGIT_ROWS, TOKEN_LANES), I32)
+        else:
+            tokens_ref[...] = _greedy_tokens(cfg, logits_ref, ws, L * COLLECTIVES_PER_LAYER, tp)
 
     return body, groups
 
 
 def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
     """Per-rank `kernel(pos, x0, rope, final_norm, weights, k_cache, v_cache) -> (logits [8, Vp]
-    f32, k_cache, v_cache[, aux])` around the `pallas_call` (no shard_map; `weights` is the
-    per-rank dict without the leading rank axis). Used by `make_decode`."""
+    f32, tokens [8, 128] i32, k_cache, v_cache[, aux])` around the `pallas_call` (no
+    shard_map; `weights` is the per-rank dict without the leading rank axis). Used by
+    `make_decode`."""
     opts = parse_options(options)
     layout.check_tp(cfg, tp)
     if opts.moe_slots is None and opts.banks is None:
@@ -532,10 +578,11 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
     k_index = 4 + n_weights
     out_shape = [
         jax.ShapeDtypeStruct((LOGIT_ROWS, vp), F32),
+        jax.ShapeDtypeStruct((LOGIT_ROWS, TOKEN_LANES), I32),
         jax.ShapeDtypeStruct(cache_shape, BF16),
         jax.ShapeDtypeStruct(cache_shape, BF16),
     ]
-    out_specs = [vmem, hbm, hbm]
+    out_specs = [vmem, vmem, hbm, hbm]
     if opts.aux_hidden:
         out_shape.append(jax.ShapeDtypeStruct((cfg.layers + 1, batch, cfg.hidden), F32))
         out_specs.append(hbm)
@@ -545,7 +592,7 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
         in_specs=[smem, vmem, vmem, vmem] + [hbm] * (n_weights + 2),
         out_specs=tuple(out_specs),
         scratch_shapes=scratch,
-        input_output_aliases={k_index: 1, k_index + 1: 2},
+        input_output_aliases={k_index: 2, k_index + 1: 3},
         compiler_params=collectives.compiler_params(COLLECTIVE_ID, vmem_limit_bytes=VMEM_LIMIT),
         interpret=pltpu.InterpretParams(dma_execution_mode="eager") if opts.interpret else False,
         name="musespark_decode_step",
@@ -595,12 +642,12 @@ def make_decode(
         rope = attention.rope_table(cfg, pos)
         out = kernel(pos, x0, rope, w["final_norm"], w, kc, vc)
         shard = out[0][:batch]  # [B, Vp] raw lm_head output
-        next_tokens = sampling.greedy_local(shard, rank, cfg, tp)
+        next_tokens = out[1][:batch, 0]  # greedy tokens, identical on every rank
         logits = sampling.gather_logits_local(shard, rank, cfg, tp) if return_logits else None
-        caches = {"k_cache": out[1][None], "v_cache": out[2][None]}
+        caches = {"k_cache": out[2][None], "v_cache": out[3][None]}
         result = (next_tokens, logits, caches)
         if opts.aux_hidden:
-            result += (out[3],)
+            result += (out[4],)
         return result
 
     def decode(weights, caches, tokens, pos):

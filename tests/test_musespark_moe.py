@@ -225,7 +225,7 @@ def make_moe_call(cfg, batch, layers, slots=moe.SLOTS, early_start=False, gap_it
         ),
         in_specs=[VM, VM, VM, VM, ANY, ANY, ANY, ANY],
         out_specs=(VM, VM),
-        scratch_shapes=moe.scratch_shapes(cfg, batch, TP, slots),
+        scratch_shapes=moe.scratch_shapes(cfg, batch, TP, slots, packed=not INTERPRET),
         interpret=INTERPRET,
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 << 20),
     )

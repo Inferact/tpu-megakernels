@@ -95,13 +95,18 @@ def router_logits(x_ffn, router_hi, router_lo):
     return _dot(x, router_hi) + _dot(x, router_lo)
 
 
-def route_from_logits(cfg: Config, logits, bias, width=LANES):
+def route_from_logits(cfg: Config, logits, bias, width=LANES, ranked=True):
     """Top-k routing from f32 logits `[B, E]` and selection bias `[1, E]` f32 (spec 3.5).
 
     Returns `(idx, w)`, both `[B, width]`: lane `k < cfg.top_k` holds the k-th selected expert
     (int32) and its mixing weight (f32, unbiased sigmoid score / (sum + route_eps)); lanes
     `>= top_k` hold `cfg.experts` (the "no expert" sentinel) and 0. Ties resolve to the lowest
     expert index. With `width=None` the result is `[B, top_k]`.
+
+    `ranked=True` computes every expert's rank with one `[E, E]` comparison per row (rank =
+    number of experts with a larger score, or an equal score and a lower index) instead of K
+    dependent argmax/mask rounds; the selection, its order and the weight normalisation
+    (scores summed in selection order) are identical.
     """
     B, E = logits.shape
     K = cfg.top_k
@@ -110,19 +115,46 @@ def route_from_logits(cfg: Config, logits, bias, width=LANES):
     sel = sc + bias.astype(F32)
     expert_ids = _iota((B, E), 1)
     lane = _iota((B, width), 1)
-    idx = jnp.full((B, width), E, I32)
-    w = jnp.zeros((B, width), F32)
-    total = jnp.zeros((B, 1), F32)
-    for k in range(K):
-        best = jnp.max(sel, axis=1, keepdims=True)
-        winner = jnp.min(jnp.where(sel == best, expert_ids, E), axis=1, keepdims=True)
-        winner_mask = expert_ids == winner
-        score = jnp.sum(jnp.where(winner_mask, sc, F32(0)), axis=1, keepdims=True)
-        sel = jnp.where(winner_mask, -jnp.inf, sel)
-        total = total + score
-        idx = jnp.where(lane == k, winner, idx)
-        w = jnp.where(lane == k, score, w)
-    return idx, w / (total + F32(cfg.route_eps))
+    if not ranked:
+        idx = jnp.full((B, width), E, I32)
+        w = jnp.zeros((B, width), F32)
+        total = jnp.zeros((B, 1), F32)
+        for k in range(K):
+            best = jnp.max(sel, axis=1, keepdims=True)
+            winner = jnp.min(jnp.where(sel == best, expert_ids, E), axis=1, keepdims=True)
+            winner_mask = expert_ids == winner
+            score = jnp.sum(jnp.where(winner_mask, sc, F32(0)), axis=1, keepdims=True)
+            sel = jnp.where(winner_mask, -jnp.inf, sel)
+            total = total + score
+            idx = jnp.where(lane == k, winner, idx)
+            w = jnp.where(lane == k, score, w)
+        return idx, w / (total + F32(cfg.route_eps))
+    row_j = _iota((E, E), 1)
+    col_e = _iota((E, E), 0)
+    idx_rows, w_rows, totals = [], [], []
+    for b in range(B):
+        s_row = sel[b : b + 1, :]  # [1, E]: expert j along lanes
+        s_col = jnp.transpose(jnp.broadcast_to(s_row, (E, E)))  # [E, E]: expert e along rows
+        ahead = (s_row > s_col) | ((s_row == s_col) & (row_j < col_e))
+        rank = jnp.sum(ahead.astype(I32), axis=1, keepdims=True)  # [E, 1]: rank of expert e
+        rank_row = jnp.transpose(jnp.broadcast_to(rank, (E, E)))[0:1, :]  # [1, E]
+        k_col = _iota((K, E), 0)
+        hit = jnp.broadcast_to(rank_row, (K, E)) == k_col  # [K, E]: exactly one hit per row
+        ids_k = jnp.sum(jnp.where(hit, expert_ids[b : b + 1, :], 0), axis=1, keepdims=True)
+        score_k = jnp.sum(jnp.where(hit, sc[b : b + 1, :], F32(0)), axis=1, keepdims=True)
+        tot = score_k[0:1]
+        for k in range(1, K):  # selection order, as the iterative version sums
+            tot = tot + score_k[k : k + 1]
+        diag = _iota((K, width), 0) == _iota((K, width), 1)  # (k, lane k) -> [1, width]
+        ids_lane = jnp.sum(jnp.where(diag, jnp.broadcast_to(ids_k, (K, width)), 0), 0, keepdims=True)
+        score_lane = jnp.sum(
+            jnp.where(diag, jnp.broadcast_to(score_k, (K, width)), F32(0)), 0, keepdims=True
+        )
+        idx_rows.append(jnp.where(lane[0:1] < K, ids_lane, E))
+        w_rows.append(jnp.where(lane[0:1] < K, score_lane, F32(0)))
+        totals.append(tot)
+    cat = lambda rows: rows[0] if B == 1 else jnp.concatenate(rows, axis=0)
+    return cat(idx_rows), cat(w_rows) / (cat(totals) + F32(cfg.route_eps))
 
 
 def route(cfg: Config, x_ffn, router_hi, router_lo, bias, width=LANES):
@@ -203,7 +235,7 @@ class MoeScratch:
 
     gate_up_q: object  # [SLOTS, Hm/2, 2*Is] int8 (packed int4 rows; `.bitcast(int4)` -> [Hm, 2*Is])
     gate_up_s: object  # [SLOTS, Hm/KC, KC/G, 2*Is] f32
-    down_q: object  # [SLOTS, Is/2, Hm] int8 (packed int4 rows)
+    down_q: object  # [SLOTS, Is/2, Hm] int8 (packed int4 rows); plain int4 [SLOTS, Is, Hm] unpacked
     down_s: object  # [SLOTS, Is/KC', KC'/G, Hm] f32
     h_pad: object  # [MR, Hm] f32: h1 padded to MR rows
     h_bd: object  # [Hm/KC, GPC*MR, KC] bf16: block-diagonal expansion of h_pad
@@ -218,10 +250,23 @@ class MoeScratch:
     def bind(cls, refs):
         return cls(*refs)
 
+    @property
+    def packed(self):
+        """Slots hold packed int8 bytes (`scratch_shapes(..., packed=True)`)."""
+        return jnp.dtype(self.gate_up_q.dtype) == jnp.dtype(jnp.int8)
 
-def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
+    def slab(self, name, slot):
+        """The `[K, N]` int4 view of `slot` of the `gate_up_q` / `down_q` slots."""
+        ref = getattr(self, name).at[slot]
+        return ref.bitcast(jnp.int4) if self.packed else ref
+
+
+def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS, packed=True):
     """Scratch tuple for `MoeScratch.bind` (real config: 3 MiB per slot + 0.2 MiB scales per
-    slot + 0.4 MiB block-diagonal/padding buffers + 1 MiB y_out for B=8)."""
+    slot + 0.4 MiB block-diagonal/padding buffers + 1 MiB y_out for B=8).
+
+    `packed=False` keeps plain int4 slots (twice the VMEM; the CPU interpreter has no ref
+    bitcast)."""
     if batch > MR:
         raise ValueError(f"batch {batch} exceeds the MXU row block {MR}")
     if cfg.top_k > LANES:
@@ -231,10 +276,11 @@ def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
     kc_gu, kc_dn = k_chunk(Hm), k_chunk(Is)
     if Hm % (32 * PACK) or Is % (32 * PACK):
         raise ValueError("packed int4 slots need K multiples of 64 rows")
+    pack, qdtype = (PACK, jnp.int8) if packed else (1, jnp.int4)
     return (
-        pltpu.VMEM((slots, Hm // PACK, 2 * Is), jnp.int8),
+        pltpu.VMEM((slots, Hm // pack, 2 * Is), qdtype),
         pltpu.VMEM((slots, Hm // kc_gu, kc_gu // G, 2 * Is), F32),
-        pltpu.VMEM((slots, Is // PACK, Hm), jnp.int8),
+        pltpu.VMEM((slots, Is // pack, Hm), qdtype),
         pltpu.VMEM((slots, Is // kc_dn, kc_dn // G, Hm), F32),
         pltpu.VMEM((MR, Hm), F32),
         pltpu.VMEM(block_diag_shape(Hm, G), BF16),
@@ -247,14 +293,15 @@ def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
     )
 
 
-def scratch_bytes(cfg: Config, batch, tp=8, slots=SLOTS):
-    """VMEM bytes of `scratch_shapes` (the packed slots at one byte per two int4 values)."""
+def scratch_bytes(cfg: Config, batch, tp=8, slots=SLOTS, packed=True):
+    """VMEM bytes of `scratch_shapes` (packed slots: one byte per two int4 values; unpacked
+    int4 slots: one byte per value, as Mosaic allocates them)."""
     total = 0
-    for s in scratch_shapes(cfg, batch, tp, slots)[:-2]:
+    for s in scratch_shapes(cfg, batch, tp, slots, packed)[:-2]:
         n = 1
         for d in s.shape:
             n *= d
-        total += n // 2 if s.dtype == jnp.int4 else n * jnp.dtype(s.dtype).itemsize
+        total += n if s.dtype == jnp.int4 else n * jnp.dtype(s.dtype).itemsize
     return total
 
 
@@ -274,18 +321,18 @@ class ExpertWeights:
 
 
 def _expert_copies(weights: ExpertWeights, sc: MoeScratch, layer, expert, slot):
+    def src(w):
+        w = w.at[layer, expert]
+        return w.bitcast(jnp.int8) if sc.packed else w
+
     return SimpleNamespace(
         gate_up_q=pltpu.make_async_copy(
-            weights.gate_up_q.at[layer, expert].bitcast(jnp.int8),
-            sc.gate_up_q.at[slot],
-            sc.sems.at[slot, 0],
+            src(weights.gate_up_q), sc.gate_up_q.at[slot], sc.sems.at[slot, 0]
         ),
         gate_up_s=pltpu.make_async_copy(
             weights.gate_up_s.at[layer, expert], sc.gate_up_s.at[slot], sc.sems.at[slot, 1]
         ),
-        down_q=pltpu.make_async_copy(
-            weights.down_q.at[layer, expert].bitcast(jnp.int8), sc.down_q.at[slot], sc.sems.at[slot, 2]
-        ),
+        down_q=pltpu.make_async_copy(src(weights.down_q), sc.down_q.at[slot], sc.sems.at[slot, 2]),
         down_s=pltpu.make_async_copy(
             weights.down_s.at[layer, expert], sc.down_s.at[slot], sc.sems.at[slot, 3]
         ),
@@ -348,12 +395,34 @@ def _distinct_count(cfg: Config, idx_tile):
     return jnp.sum(present.astype(I32))
 
 
+def _batch_of(cfg: Config, sc: MoeScratch):
+    return sc.y_out.shape[0] // cfg.top_k
+
+
+def _route_expert(sc: MoeScratch, k):
+    """Scalar expert id of route slot `k` of row 0 (the B=1 fast path: all K are distinct)."""
+    lane = _iota((1, sc.idx.shape[1]), 1)
+    return jnp.sum(jnp.where(lane == k, sc.idx[0:1, :], 0))
+
+
+def _b1_waves(cfg: Config, slots):
+    """Static waves of the B=1 stream: route slots `[w*slots, min((w+1)*slots, K))`."""
+    K = cfg.top_k
+    return [list(range(w * slots, min((w + 1) * slots, K))) for w in range(-(-K // slots))]
+
+
 def start_expert_stream(cfg: Config, layer, weights: ExpertWeights, sc: MoeScratch):
     """Issue the DMAs of the first wave of experts (call right after `route_to_scratch`).
 
-    Also records the expert ids of the first two waves in `sc.wave_ids`."""
+    Also records the expert ids of the first two waves in `sc.wave_ids` (generic path). At
+    B=1 the K routes are K distinct experts, so the waves are static: route slots 0..slots-1
+    first (no selection, no bookkeeping)."""
     E = cfg.experts
     slots = sc.gate_up_q.shape[0]
+    if _batch_of(cfg, sc) == 1:
+        for s, k in enumerate(_b1_waves(cfg, slots)[0]):
+            _start(_expert_copies(weights, sc, layer, _route_expert(sc, k), s))
+        return
     idx_tile = sc.idx[...]
     picks, pending = _wave_experts(idx_tile < E, idx_tile, E, slots)
     second, _ = _wave_experts(pending, idx_tile, E, slots)
@@ -377,7 +446,8 @@ def _store_rows(sc: MoeScratch, y, consumed, batch, K):
 
 
 def expert_stream(
-    cfg: Config, layer, h1, weights: ExpertWeights, sc: MoeScratch, started=False, after_wave=None
+    cfg: Config, layer, h1, weights: ExpertWeights, sc: MoeScratch, started=False, after_wave=None,
+    compute=True,
 ):
     """Run every distinct expert of the batch once; fills `sc.y_out` (see the module docstring).
 
@@ -385,12 +455,13 @@ def expert_stream(
     `sc.idx` must hold the route tile (`route_to_scratch`). With `started=True` the first
     wave's DMAs were already issued by `start_expert_stream`. `after_wave(w, n_waves)`
     (optional) is traced at the end of every wave body, i.e. after the DMAs of wave `w + 1`
-    were issued (`n_waves` is the traced wave count).
+    were issued (`n_waves` is the traced wave count). `compute=False` (profiling) keeps the
+    DMAs and waits but skips the dots.
     """
     B, Hm = h1.shape
     K, E, G = cfg.top_k, cfg.experts, cfg.group_size
     slots = sc.gate_up_q.shape[0]
-    Is = sc.down_q.shape[1] * PACK  # packed int8 rows -> int4 rows
+    Is = sc.down_q.shape[1] * (PACK if sc.packed else 1)  # int8 rows -> int4 rows
     kc_dn = k_chunk(Is)
 
     if not started:
@@ -410,15 +481,41 @@ def expert_stream(
 
     def gate_up(slot):
         _wait(_expert_copies(weights, sc, layer, 0, slot))
-        w = sc.gate_up_q.at[slot].bitcast(jnp.int4)  # [Hm, 2*Is]
-        return int4_group_dot(sc.h_bd, w, sc.gate_up_s.at[slot])
+        if not compute:
+            return jnp.zeros((MR, 2 * Is), F32)
+        return int4_group_dot(sc.h_bd, sc.slab("gate_up_q", slot), sc.gate_up_s.at[slot])
 
-    def finish(slot, gu, consumed):
+    def down(slot, gu):
         gate, up = gu[:, :Is], gu[:, Is:]
         a = r16(gate * jax.nn.sigmoid(gate) * up)
-        w = sc.down_q.at[slot].bitcast(jnp.int4)  # [Is, Hm]
-        y = int4_group_dot(block_diag_values(a, G, kc_dn), w, sc.down_s.at[slot])
-        _store_rows(sc, y, consumed, B, K)
+        return int4_group_dot(
+            block_diag_values(a, G, kc_dn), sc.slab("down_q", slot), sc.down_s.at[slot]
+        )
+
+    def finish(slot, gu, consumed):
+        if not compute:
+            return
+        _store_rows(sc, down(slot, gu), consumed, B, K)
+
+    if B == 1:
+        # Static stream: route slot k is expert k of the tile (all distinct), wave w holds
+        # route slots w*slots.. ; y_out row k gets a plain store. Same one-expert skew as
+        # `wave_body`; slot s is refilled with the next wave's expert right after its down
+        # projection was issued.
+        waves = _b1_waves(cfg, slots)
+        for w, routes in enumerate(waves):
+            nxt = waves[w + 1] if w + 1 < len(waves) else []
+            gu = [gate_up(0)]
+            for s, k in enumerate(routes):
+                if s + 1 < len(routes):
+                    gu.append(gate_up(s + 1))
+                if compute:
+                    sc.y_out[k : k + 1, :] = down(s, gu[s])[0:1]
+                if s < len(nxt):
+                    _start(_expert_copies(weights, sc, layer, _route_expert(sc, nxt[s]), s))
+            if after_wave is not None:
+                after_wave(w, len(waves))
+        return
 
     def wave_body(cur, nxt, refill, select_ahead=None):
         """One wave of `slots` experts; `refill` in {"always", "cond", "never"}.
