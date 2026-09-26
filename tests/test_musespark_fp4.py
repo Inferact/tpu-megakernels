@@ -612,3 +612,45 @@ def test_fp4_expert_stream_matches_reference(cfg, batch, distinct):
     print(f"B={batch} distinct={len(np.unique(idx))}: rel y_out err {y_err:.2e}, max |m| err {m_err:.2e}")
     assert y_err <= 2e-3, y_err
     assert m_err <= 2e-2, m_err
+
+
+@pytest.mark.parametrize("K,N", [(512, 128), (64, 512), (4096, 1024), (512, 4096)])
+def test_dequant_fp4_pallas_matches_xla_bits(K, N):
+    rng = _rng(K + 3 * N)
+    E = 3
+    packed = quant.pack_fp4_rows(rng.integers(0, 16, size=(E, K, N), dtype=np.uint8))
+    bs = quant.fp4_scales_to_chunked(random_e4m3(rng, (E, K // 16, N)), K)
+    gs = rng.uniform(1e-5, 3e-5, size=(E, 1, N)).astype(np.float32)
+    want = quant.dequant_fp4_jnp(jnp.asarray(packed), jnp.asarray(bs), jnp.asarray(gs)).astype(jnp.bfloat16)
+    got = fp4.dequant_fp4_pallas(jnp.asarray(packed), jnp.asarray(bs), jnp.asarray(gs))
+    assert got.dtype == jnp.bfloat16 and got.shape == (E, K, N)
+    _assert_same_bits(got, want, packed)
+    got = fp4.dequant_fp4_pallas(jnp.asarray(packed), jnp.asarray(bs.view(np.uint8)), jnp.asarray(gs))
+    _assert_same_bits(got, want, packed)
+
+
+def _assert_same_bits(got, want, packed):
+    g, w = np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+    bad = g != w
+    if bad.any():
+        idx = np.argwhere(bad)
+        codes = quant.unpack_fp4_rows(np.asarray(packed))
+        raise AssertionError(
+            f"{bad.sum()}/{bad.size} bf16 bit mismatches; experts {np.unique(idx[:, 0]).tolist()}, "
+            f"blocks {np.unique(idx[:, 1] // 16)[:8].tolist()}, cols {np.unique(idx[:, 2])[:8].tolist()}; "
+            f"first {tuple(idx[0])}: got {np.asarray(got).astype(np.float32)[tuple(idx[0])]} "
+            f"want {np.asarray(want).astype(np.float32)[tuple(idx[0])]} code {codes[tuple(idx[0])]}; "
+            f"codes at mismatches {np.unique(codes[bad]).tolist()}"
+        )
+
+
+def test_dequantized_expert_layer_paths_agree(converted):
+    _, dst, _ = converted
+    arrays = load.read_presharded(dst)
+    Is = MINI.expert_hidden // TP
+    w = {n: jnp.asarray(arrays[n][1]) for n in layout.FP4_EXPERT_FAMILIES}
+    a = fp4.dequantized_expert_layer(w, 2, Is, pallas=False)
+    b = fp4.dequantized_expert_layer(w, 2, Is, pallas=True)
+    for x, y in zip(a, b):
+        assert x.dtype == y.dtype == jnp.bfloat16 and x.shape == y.shape
+        assert np.array_equal(np.asarray(x).view(np.uint16), np.asarray(y).view(np.uint16))

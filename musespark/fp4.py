@@ -410,3 +410,65 @@ def expert_stream(cfg: Config, layer, h1, weights: Fp4ExpertWeights, sc: Fp4Scra
         sc.done[...] = jnp.where(consumed, I32(1), sc.done[...])
         if after_wave is not None:
             after_wave(w)
+
+
+# ---------------------------------------------------------------------------------------------
+# Prefill dequant kernel (bf16 experts for `lax.ragged_dot`)
+# ---------------------------------------------------------------------------------------------
+
+
+def _dequant_kernel(p_ref, s_ref, g_ref, o_ref):
+    """One `[KC/8, N]` int32 chunk -> `[KC, N]` bf16 = `e2m1 * e4m3 * gs` (f32 maths, exactly the
+    XLA path of `quant.dequant_fp4_jnp`)."""
+    kc, n = o_ref.shape
+    v = pltpu.bitcast(p_ref[...], FP4).astype(F32).reshape(kc // BLOCK, BLOCK, n)
+    w = (v * s_ref[...].astype(F32)[:, None, :]).reshape(kc, n) * g_ref[...]
+    o_ref[...] = w.astype(BF16)
+
+
+def dequant_fp4_pallas(packed, bs, gs):
+    """`packed [E, K/8, N]` int32, `bs [E, K/KC, KC/16, N]` e4m3, `gs [E, 1, N]` f32 (a
+    per-column global scale, broadcast for the down projection) -> bf16 `[E, K, N]`.
+
+    Bit-identical to `quant.dequant_fp4_jnp(...).astype(bf16)` but ~10x faster on TPU: the
+    int32 -> fp4 relayout is a free `pltpu.bitcast` instead of XLA's minor-axis transpose."""
+    E, K8, N = packed.shape
+    chunks, gpc = bs.shape[1], bs.shape[2]
+    kc = gpc * BLOCK
+    K = K8 * FP4_PER_WORD
+    if chunks * kc != K:
+        raise ValueError(f"block scales {bs.shape} do not match K={K}")
+    return pl.pallas_call(
+        _dequant_kernel,
+        out_shape=jax.ShapeDtypeStruct((E, K, N), BF16),
+        grid=(E, chunks),
+        in_specs=[
+            pl.BlockSpec((None, kc // FP4_PER_WORD, N), lambda e, c: (e, c, 0)),
+            pl.BlockSpec((None, None, gpc, N), lambda e, c: (e, c, 0, 0)),
+            pl.BlockSpec((None, 1, N), lambda e, c: (e, 0, 0)),
+        ],
+        out_specs=pl.BlockSpec((None, kc, N), lambda e, c: (e, c, 0)),
+        interpret=jax.default_backend() != "tpu",
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
+    )(packed, lax.bitcast_convert_type(bs, FP8) if bs.dtype == jnp.uint8 else bs, gs.astype(F32))
+
+
+def dequantized_expert_layer(w, l, isl, pallas=None):
+    """This rank's experts of layer `l` from the fp4 families of a weight tree `w` as bf16
+    `(gate_up [E, Hm, 2*Is], down [E, Is, Hm])`. `pallas` (default: on TPU) selects
+    `dequant_fp4_pallas`, otherwise the XLA path (`quant.dequant_fp4_jnp`); both give the
+    same bits."""
+    gs = w["expert_gs"][l]  # [E, 8, 128]
+    E = gs.shape[0]
+    col = jnp.arange(2 * isl, dtype=I32)[None, :] < isl
+    gu_gs = jnp.where(col, gs[:, 0:1, 0:1], gs[:, 1:2, 0:1])  # [E, 1, 2*Is]
+    dn_gs = gs[:, 2:3, 0:1]  # [E, 1, 1]
+    pallas = jax.default_backend() == "tpu" if pallas is None else pallas
+    if pallas:
+        Hm = w["down_fp4"].shape[-1]
+        gate_up = dequant_fp4_pallas(w["gate_up_fp4"][l], w["gate_up_bs"][l], gu_gs)
+        down = dequant_fp4_pallas(w["down_fp4"][l], w["down_bs"][l], jnp.broadcast_to(dn_gs, (E, 1, Hm)))
+        return gate_up, down
+    gate_up = dequant_fp4_jnp(w["gate_up_fp4"][l], w["gate_up_bs"][l], gu_gs)
+    down = dequant_fp4_jnp(w["down_fp4"][l], w["down_bs"][l], dn_gs)
+    return gate_up.astype(BF16), down.astype(BF16)

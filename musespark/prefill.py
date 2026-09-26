@@ -110,22 +110,16 @@ def _attention(cfg, q, k, v, positions, real, window, tp):
 def dequantized_experts(w, l, isl):
     """This rank's experts of layer `l` as bf16 `(gate_up [E, Hm, 2*Is], down [E, Is, Hm])`
     from either expert format: int4 g128 (`quant.dequantize_int4`, container v1) or NVFP4
-    (`quant.dequant_fp4_jnp`: `e2m1 * e4m3` exact, times the per-expert global scales of
-    `expert_gs` -- row 0 for the gate columns, row 1 for the up columns, row 2 for down)."""
+    (`fp4.dequantized_expert_layer`: `e2m1 * e4m3` exact, times the per-expert global scales of
+    `expert_gs` -- row 0 for the gate columns, row 1 for the up columns, row 2 for down; a
+    Pallas dequant kernel on TPU, XLA elsewhere, same bits)."""
     if "gate_up_fp4" in w:
-        gs = w["expert_gs"][l]  # [E, 8, 128]
-        col = _iota_cols(2 * isl) < isl  # [1, 2*Is]
-        gu_gs = jnp.where(col, gs[:, 0:1, 0:1], gs[:, 1:2, 0:1])  # [E, 1, 2*Is]
-        gate_up = quant.dequant_fp4_jnp(w["gate_up_fp4"][l], w["gate_up_bs"][l], gu_gs)
-        down = quant.dequant_fp4_jnp(w["down_fp4"][l], w["down_bs"][l], gs[:, 2:3, 0:1])
-        return gate_up.astype(BF16), down.astype(BF16)
+        from musespark import fp4
+
+        return fp4.dequantized_expert_layer(w, l, isl)
     gate_up = quant.dequantize_int4(w["gate_up_q"][l], w["gate_up_s"][l]).astype(BF16)
     down = quant.dequantize_int4(w["down_q"][l], w["down_s"][l]).astype(BF16)
     return gate_up, down
-
-
-def _iota_cols(n):
-    return jnp.arange(n, dtype=jnp.int32)[None, :]
 
 
 def _experts(cfg, w, l, h1, idx, weights, rank, tp):
