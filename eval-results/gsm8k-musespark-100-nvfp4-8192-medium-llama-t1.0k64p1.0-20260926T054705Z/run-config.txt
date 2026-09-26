@@ -1,0 +1,4 @@
+head: c11b8b2b0ac64430e1b2dea817ccef93a7bf5df2
+weights: /filestore/weights/muse-spark-tp8-nvfp4
+context: 16384 max_gen_toks: 8192 reasoning_effort: medium num_fewshot: 8 limit: 100
+task: gsm8k_cot_llama sampling: t1.0k64p1.0 temperature: 1.0 top_k: 64 top_p: 1.0 seed: 0

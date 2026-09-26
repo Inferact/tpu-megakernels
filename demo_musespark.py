@@ -34,7 +34,7 @@ sys.path.insert(0, str(ROOT))
 import openai_server
 from musespark import chat, sampling
 from musespark import load as ms_load
-from musespark.prefill import CHUNK, make_prefill, pad_prompt
+from musespark.prefill import CHUNK, QUERY_BLOCK, make_prefill, pad_prompt
 
 DEFAULT_WEIGHTS = "/filestore/weights/muse-spark-tp8-int4"
 DEFAULT_CHECKPOINT = "/filestore/weights/Muse-Spark-1.2-816B-A42B-open"
@@ -183,7 +183,11 @@ class Session:
 
         One executable per padded length: the first call of a bucket compiles (logged).
         """
-        tokens, length = pad_prompt(self.cfg, ids)
+        # prompts longer than one query block are padded to whole blocks: `prefill._attention`
+        # reshapes the query rows into `T // QUERY_BLOCK` blocks, which needs T to be a multiple
+        # of the block (a 704-token bucket failed the reshape); pad tokens are masked by `length`
+        chunk = CHUNK if len(ids) <= QUERY_BLOCK else QUERY_BLOCK
+        tokens, length = pad_prompt(self.cfg, ids, chunk)
         bucket = tokens.shape[0]
         if bucket + self.args.steps_per_call > self.context:
             raise ValueError(f"prompt of {length} tokens does not fit --context {self.context}")

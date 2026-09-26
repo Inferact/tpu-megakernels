@@ -1,0 +1,3 @@
+head: 37bd619e5e59b3272b18f69849af6323833894ab
+weights: /filestore/weights/muse-spark-tp8-int4
+context: 16384 max_gen_toks: 8192 reasoning_effort: medium num_fewshot: 5 limit: 100
