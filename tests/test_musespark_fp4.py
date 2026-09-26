@@ -481,3 +481,134 @@ def test_reference_expert_weights_fp4_branch(converted):
     want = quant.dequant_fp4_np(arrays["down_fp4"][r, l], arrays["down_bs"][r, l], gs[:, 2:3, 0:1])
     assert np.array_equal(np.asarray(down), want.astype(ml_dtypes.bfloat16))
     assert set(musespark.layer_weights({**{n: arrays[n][r] for n in layout.FP4_EXPERT_FAMILIES}}, 0)) == set(layout.FP4_EXPERT_FAMILIES)
+
+
+# ---------------------------------------------------------------------------------------------
+# In-kernel expert stream (`fp4.expert_stream`, the decode path) vs a numpy reference
+# ---------------------------------------------------------------------------------------------
+
+ANY = pl.BlockSpec(memory_space=pl.ANY)
+
+
+def random_fp4_expert_weights(cfg, seed, tp=TP):
+    """Random per-rank fp4 families (jax arrays) with realistic scale magnitudes, plus their
+    exact f32 dequantization (`gate_up [L, E, Hm, 2Is]`, `down [L, E, Is, Hm]`)."""
+    rng = _rng(seed)
+    L, E, Hm = cfg.layers, cfg.experts, cfg.moe_hidden
+    Is = cfg.expert_hidden // tp
+    gu = quant.pack_fp4_rows(rng.integers(0, 16, size=(L, E, Hm, 2 * Is), dtype=np.uint8))
+    dn = quant.pack_fp4_rows(rng.integers(0, 16, size=(L, E, Is, Hm), dtype=np.uint8))
+    gu_bs, dn_bs = random_e4m3(rng, (L, E, Hm // 16, 2 * Is)), random_e4m3(rng, (L, E, Is // 16, Hm))
+    gs = np.zeros((L, E, 8, 128), np.float32)
+    gs[..., 0:3, :] = rng.uniform(1e-5, 3e-5, size=(L, E, 3, 1)) * np.array([1, 1.2, 4])[None, None, :, None]
+    gs[..., 2, :] /= np.sqrt(Is) / np.sqrt(Hm) * 2  # keep down outputs O(1)
+    col = np.concatenate([np.repeat(gs[..., 0:1, 0:1], Is, -1), np.repeat(gs[..., 1:2, 0:1], Is, -1)], -1)
+    gate_up = quant.dequant_fp4_np(gu, gu_bs, col)
+    down = quant.dequant_fp4_np(dn, dn_bs, gs[..., 2:3, 0:1])
+    weights = fp4.Fp4ExpertWeights(
+        jnp.asarray(gu), jnp.asarray(quant.fp4_scales_to_chunked(gu_bs, Hm)),
+        jnp.asarray(dn), jnp.asarray(quant.fp4_scales_to_chunked(dn_bs, Is)), jnp.asarray(gs),
+    )
+    return weights, gate_up, down
+
+
+def make_fp4_moe_call(cfg, batch, layers, slots=fp4.SLOTS):
+    """`(idx_tile, w_tile, h1, post, *fp4 families) -> (y_out, m)`: route materialisation +
+    prefetch + `fp4.expert_stream` + `moe.finalize` per layer, looped in-kernel."""
+    import importlib
+
+    moe = importlib.import_module("musespark.moe")
+    K, Hm = cfg.top_k, cfg.moe_hidden
+
+    def kernel(idx_ref, w_ref, h1_ref, post_ref, *rest):
+        hbm = rest[:5]
+        y_ref, m_ref = rest[5:7]
+        sc = fp4.Fp4Scratch.bind(rest[7:])
+        weights = fp4.Fp4ExpertWeights(*hbm)
+
+        @pl.loop(0, layers)
+        def _layer(layer):
+            moe.route_to_scratch(cfg, sc, idx_ref[...], w_ref[...])
+            fp4.start_expert_stream(cfg, layer, weights, sc)
+            fp4.expert_stream(cfg, layer, h1_ref[...], weights, sc, started=True)
+            y_ref[...] = sc.y_out[...]
+            m_ref[...] = moe.finalize(cfg, sc.y_out, sc.w, post_ref[...], batch)
+
+    call = pl.pallas_call(
+        kernel,
+        out_shape=(jax.ShapeDtypeStruct((K * batch, Hm), jnp.float32),
+                   jax.ShapeDtypeStruct((batch, Hm), jnp.float32)),
+        in_specs=[VM] * 4 + [ANY] * 5,
+        out_specs=(VM, VM),
+        scratch_shapes=fp4.scratch_shapes(cfg, batch, TP, slots),
+        interpret=INTERPRET,
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 << 20),
+    )
+    return jax.jit(call)
+
+
+def _r16(x):
+    return np.asarray(np.asarray(x, np.float32).astype(ml_dtypes.bfloat16), np.float32)
+
+
+def ref_fp4_outputs(cfg, layer, h1, idx, w, post, gate_up, down, tp=TP):
+    """numpy: `y_out [K*B, Hm]` (row k*B + b = partial output of expert idx[b, k]) and the
+    finalized `m [B, Hm]` (spec 3.5) on the exactly dequantized f32 experts."""
+    B, K = idx.shape
+    Is = cfg.expert_hidden // tp
+    Y = np.zeros((K * B, cfg.moe_hidden), np.float64)
+    for b in range(B):
+        for k in range(K):
+            e = int(idx[b, k])
+            gu = h1[b].astype(np.float64) @ gate_up[layer, e].astype(np.float64)
+            gate, up = gu[:Is], gu[Is:]
+            a = _r16(gate / (1 + np.exp(-gate)) * up)
+            Y[k * B + b] = a.astype(np.float64) @ down[layer, e].astype(np.float64)
+    Y = Y.astype(np.float32)
+    m = np.zeros((B, cfg.moe_hidden), np.float32)
+    for k in range(K):
+        t = _r16(_r16(Y[k * B:(k + 1) * B]) * post.reshape(1, -1))
+        yn = t / np.sqrt(np.mean(t * t, axis=1, keepdims=True) + np.float32(cfg.post_eps))
+        m += w[:, k:k + 1] * yn
+    return Y, _r16(m)
+
+
+def _routes(cfg, batch, rng, distinct=None):
+    B, K, E = batch, cfg.top_k, cfg.experts
+    if distinct is None:
+        idx = np.stack([rng.choice(E, K, replace=False) for _ in range(B)])
+    else:
+        rows_per_group = max(1, B * K // distinct)
+        idx = np.stack([(np.arange(K) + (b // rows_per_group) * K) % E for b in range(B)])
+    w = rng.uniform(0.1, 1, (B, K)).astype(np.float32)
+    return idx.astype(np.int32), w / w.sum(1, keepdims=True)
+
+
+STREAM_CASES = [(MINI, 1, None), (MINI, 4, None), (MINI, 8, 4), (MINI, 8, None),
+                (Config(layers=2, experts=16), 1, None), (Config(layers=2, experts=16), 8, None)]
+
+
+@pytest.mark.parametrize("cfg,batch,distinct", STREAM_CASES,
+                         ids=["mini-b1", "mini-b4", "mini-b8-4experts", "mini-b8", "real-b1", "real-b8"])
+def test_fp4_expert_stream_matches_reference(cfg, batch, distinct):
+    if INTERPRET and cfg.moe_hidden > MINI.moe_hidden and batch > 1:
+        pytest.skip("real-width B=8 stream is slow in interpret mode")
+    rng = _rng(batch * 3 + (distinct or 0))
+    weights, gate_up, down = random_fp4_expert_weights(cfg, seed=batch)
+    idx, w = _routes(cfg, batch, rng, distinct)
+    h1 = _r16(rng.standard_normal((batch, cfg.moe_hidden)).astype(np.float32))
+    post = _r16(1 + 0.1 * rng.standard_normal((1, cfg.moe_hidden)).astype(np.float32))
+    it = np.full((batch, fp4.LANES), 0, np.int32)
+    wt = np.zeros((batch, fp4.LANES), np.float32)
+    it[:, :cfg.top_k], wt[:, :cfg.top_k] = idx, w
+    layers = cfg.layers
+    call = make_fp4_moe_call(cfg, batch, layers)
+    y, m = call(jnp.asarray(it), jnp.asarray(wt), jnp.asarray(h1), jnp.asarray(post),
+                *vars(weights).values())
+    y, m = np.asarray(y), np.asarray(m)
+    Y_ref, m_ref = ref_fp4_outputs(cfg, layers - 1, h1, idx, w, post, gate_up, down)
+    y_err = np.abs(y - Y_ref).max() / np.abs(Y_ref).max()
+    m_err = np.abs(m - m_ref).max()
+    print(f"B={batch} distinct={len(np.unique(idx))}: rel y_out err {y_err:.2e}, max |m| err {m_err:.2e}")
+    assert y_err <= 2e-3, y_err
+    assert m_err <= 2e-2, m_err

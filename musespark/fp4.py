@@ -290,3 +290,123 @@ def down_dot(sc: Fp4Scratch, slot, a):
     y = fp4_block_dot(block_diag16_values(a, k_chunk(Is)), sc.down_fp4.at[slot], sc.down_bs.at[slot],
                       a.shape[0])
     return apply_down_gs(y, sc.expert_gs[slot])
+
+
+# ---------------------------------------------------------------------------------------------
+# Expert stream (mirrors `moe.expert_stream`; routing/bookkeeping helpers are shared with moe)
+# ---------------------------------------------------------------------------------------------
+
+
+def start_expert_stream(cfg: Config, layer, weights: Fp4ExpertWeights, sc: Fp4Scratch):
+    """Issue the DMAs of the first wave of experts (call right after `moe.route_to_scratch`)
+    and record the expert ids of the first two waves in `sc.wave_ids` (as `moe.start_expert_stream`)."""
+    from musespark import moe
+
+    E = cfg.experts
+    slots = sc.gate_up_fp4.shape[0]
+    idx_tile = sc.idx[...]
+    picks, pending = moe._wave_experts(idx_tile < E, idx_tile, E, slots)
+    second, _ = moe._wave_experts(pending, idx_tile, E, slots)
+    for s, p in enumerate(picks):
+        sc.wave_ids[0, s] = p.expert
+        sc.wave_ids[1, s] = second[s].expert
+
+        @pl.when(p.has)
+        def _start_first(p=p, s=s):
+            start_copies(expert_copies(weights, sc, layer, p.expert, s))
+
+
+def expert_stream(cfg: Config, layer, h1, weights: Fp4ExpertWeights, sc: Fp4Scratch,
+                  started=False, after_wave=None):
+    """NVFP4 twin of `moe.expert_stream`: run every distinct expert of the batch once and fill
+    `sc.y_out` (`[K*B, Hm]` f32, row `k*B + b`, this rank's partial down-projection output,
+    global scales applied). Same wave/slot/refill structure and the same bookkeeping tiles, so
+    `moe.route_to_scratch` / `moe.finalize` and the integrator's `after_wave` hook are reused
+    unchanged. `h1 [B, Hm]` (bf16-valued): the block-diagonal expansion uses the real B rows
+    (`sc.h_bd` is `[Hm/KC, 32*B, KC]`)."""
+    from musespark import moe
+
+    B, Hm = h1.shape
+    K, E = cfg.top_k, cfg.experts
+    slots = sc.gate_up_fp4.shape[0]
+    Is = sc.down_fp4.shape[1] * FP4_PER_WORD
+    if sc.h_bd.shape[1] != (sc.h_bd.shape[2] // BLOCK) * B:
+        raise ValueError(f"h_bd was sized for {sc.h_bd.shape[1] // (sc.h_bd.shape[2] // BLOCK)} "
+                         f"rows, h1 has {B}")
+    if not started:
+        start_expert_stream(cfg, layer, weights, sc)
+
+    block_diag16_to_ref(sc.h_bd, h1.astype(F32))
+    idx_tile = sc.idx[...]
+    n_waves = (moe._distinct_count(cfg, idx_tile) + slots - 1) // slots
+
+    def gate_up(slot):
+        wait_copies(expert_copies(weights, sc, layer, 0, slot))
+        return gate_up_dot(sc, slot, B)
+
+    def finish(slot, gu, consumed):
+        gate, up = gu[:, :Is], gu[:, Is:]
+        a = moe.r16(gate * jax.nn.sigmoid(gate) * up)
+        moe._store_rows(sc, down_dot(sc, slot, a), consumed, B, K)
+
+    def wave_body(cur, nxt, refill, select_ahead=None):
+        gu = [gate_up(0)]
+        for s in range(slots):
+            if s + 1 < slots:
+                gu.append(gate_up(s + 1))
+            if s == 0 and select_ahead is not None:
+                select_ahead()
+            finish(s, gu[s], cur[s].consumed)
+            if refill == "always":
+                start_copies(expert_copies(weights, sc, layer, nxt[s].expert, s))
+            elif refill == "cond":
+
+                @pl.when(nxt[s].has)
+                def _refill(s=s):
+                    start_copies(expert_copies(weights, sc, layer, nxt[s].expert, s))
+
+    @pl.loop(0, n_waves)
+    def _wave(w):
+        pending = (idx_tile < E) & (sc.done[...] == 0)
+        parity = w % 2
+        cur, nxt = [], []
+        for group, slot_ids in ((cur, sc.wave_ids.at[parity]), (nxt, sc.wave_ids.at[1 - parity])):
+            for s in range(slots):
+                expert = slot_ids[s]
+                consumed = pending & (idx_tile == expert)
+                pending = pending & ~consumed
+                group.append(SimpleNamespace(expert=expert, has=expert < E, consumed=consumed))
+
+        def select_ahead(pending=pending):
+            ahead, _ = moe._wave_experts(pending, idx_tile, E, slots)
+            for s in range(slots):
+                sc.wave_ids[parity, s] = ahead[s].expert
+
+        full, next_full, next_any = cur[-1].has, nxt[-1].has, nxt[0].has
+
+        @pl.when(full & next_full)
+        def _steady():
+            wave_body(cur, nxt, "always", select_ahead)
+
+        @pl.when(full & next_any & ~next_full)
+        def _before_tail():
+            wave_body(cur, nxt, "cond")
+
+        @pl.when(full & ~next_any)
+        def _last_full():
+            wave_body(cur, nxt, "never")
+
+        @pl.when(~full)
+        def _tail():
+            for s in range(slots):
+
+                @pl.when(cur[s].has)
+                def _one(s=s):
+                    finish(s, gate_up(s), cur[s].consumed)
+
+        consumed = cur[0].consumed
+        for p in cur[1:]:
+            consumed = consumed | p.consumed
+        sc.done[...] = jnp.where(consumed, I32(1), sc.done[...])
+        if after_wave is not None:
+            after_wave(w)
