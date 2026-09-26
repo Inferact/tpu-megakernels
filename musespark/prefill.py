@@ -19,7 +19,8 @@ after every layer) and are only there so one executable serves every prompt of t
 
 Numerics mirror the decode kernel (design.md section 4), i.e. the spec's rounding points:
 f32 residual stream, `r16` (bf16 round trip) at every norm output and branch output, bf16 x bf16
-GEMMs with f32 accumulation, the f32 router as `dot(x, hi) + dot(x, lo)`, quantized experts
+GEMMs with f32 accumulation (int8 dense containers: `dot(x, bf16(q)) * scale`, `_dense`, the
+kernel's int8 maths), the f32 router as `dot(x, hi) + dot(x, lo)`, quantized experts
 (int4 g128 or NVFP4 families, `dequantized_experts`) dequantized on the fly one layer at a
 time inside the layer loop and rounded to bf16, `gate_up` outputs kept in f32 until the SwiGLU rounding, the per-expert
 `post_expert_norm` applied to the cross-rank sum of the partial `down` outputs. Attention scores
@@ -68,6 +69,20 @@ def pad_prompt(cfg: Config, ids, chunk=CHUNK):
 def _dot(x, w):
     """bf16 x bf16 -> f32 accumulate (the MXU path of the kernel)."""
     return jnp.dot(x.astype(BF16), w.astype(BF16), preferred_element_type=F32)
+
+
+def _dense(w, name, l, x):
+    """`x @ W[name][l]` -> f32 for a dense projection in either container dense format: the
+    bf16 family, or the int8 pair (`layout.int8_family` / `layout.scale_family`) as
+    `dot(x, bf16(q)) * scale` -- the kernel's int8 maths (`quant.int8_dot`), exact int8 -> bf16
+    conversion, f32 accumulation, then the per-column scale. `l=None` for the lm_head."""
+    key = layout.int8_family(name)
+    if key in w:
+        q, s = w[key], w[layout.scale_family(name)]
+        if l is not None:
+            q, s = q[l], s[l]
+        return _dot(x, q) * s
+    return _dot(x, w[name][l] if l is not None else w[name])
 
 
 def _attend_block(cfg, q, qpos, k, v, kpos, real, window):
@@ -202,11 +217,11 @@ def make_prefill(mesh, cfg: Config, context, tp=8, taps=False):
             window = jnp.where(is_full, jnp.int32(2**30), jnp.int32(cfg.sliding_window))
             xb = x.astype(BF16)
             # --- attention --------------------------------------------------------------
-            q = r16(_dot(xb, w["q"][l])).reshape(T, qh, D)
-            kv = r16(_dot(xb, w["kv"][l]))
+            q = r16(_dense(w, "q", l, xb)).reshape(T, qh, D)
+            kv = r16(_dense(w, "kv", l, xb))
             k = kv[:, :kvw].reshape(T, kvh, D)
             v = kv[:, kvw:].reshape(T, kvh, D)
-            g = r16(_dot(xb, w["gate"][l])).reshape(T, qh, D)
+            g = r16(_dense(w, "gate", l, xb)).reshape(T, qh, D)
             q = r16(rms(q, None, cfg.rms_eps))
             k = r16(rms(k, None, cfg.rms_eps))
             q = jnp.where(is_full, q, rope_rotate_half(q, positions, cfg.rope_theta))
@@ -220,7 +235,7 @@ def make_prefill(mesh, cfg: Config, context, tp=8, taps=False):
             vc = lax.dynamic_update_slice(vc, v_slab, (l, row, 0, 0))
             o = _attention(cfg, q, k, v, positions, real, window, tp)
             o = r16(rms(o, None, cfg.rms_eps) * jax.nn.sigmoid(g)).reshape(T, qh * D)
-            attn_out = r16(lax.psum(_dot(o, w["o"][l]), "tp"))  # [T, H]
+            attn_out = r16(lax.psum(_dense(w, "o", l, o), "tp"))  # [T, H]
             # --- post-attention boundary --------------------------------------------------
             nb = r16(rms(attn_out, None, cfg.post_eps))
             s = w["attn_gate_alpha"][l] * s + w["attn_gate_beta"][l] * nb
@@ -231,12 +246,12 @@ def make_prefill(mesh, cfg: Config, context, tp=8, taps=False):
             idx, weights = route(
                 logits * cfg.output_multiplier, w["router_bias"][l], cfg.top_k, cfg.route_eps
             )
-            h0 = r16(_dot(xf, w["pre"][l])).astype(BF16)  # [T, Hm/tp]
+            h0 = r16(_dense(w, "pre", l, xf)).astype(BF16)  # [T, Hm/tp]
             h0 = lax.all_gather(h0, "tp", axis=1, tiled=True).astype(F32)  # [T, Hm]
             h1 = r16(rms(h0, w["pre_expert_norm"][l].astype(F32), cfg.rms_eps))
             m = _experts(cfg, w, l, h1, idx, weights, rank, tp)  # [T, Hm/tp]
             m = lax.all_gather(r16(m).astype(BF16), "tp", axis=1, tiled=True)  # [T, Hm]
-            out = r16(_dot(m, w["post"][l])).astype(BF16)  # [T, H/tp]
+            out = r16(_dense(w, "post", l, m)).astype(BF16)  # [T, H/tp]
             ffn_out = lax.all_gather(out, "tp", axis=1, tiled=True).astype(F32)  # [T, H]
             # --- post-FFN boundary ------------------------------------------------------------
             t = r16(ffn_out * w["post_ffn_norm"][l].astype(F32))
@@ -252,7 +267,7 @@ def make_prefill(mesh, cfg: Config, context, tp=8, taps=False):
         s, _, kc, vc, hidden = lax.fori_loop(0, L, layer, (s, x, kc, vc, hidden))
         h_last = lax.dynamic_slice_in_dim(r16(s), length - 1, 1, axis=0)  # [1, H]
         h_last = r16(rms(h_last, w["final_norm"].astype(F32), cfg.rms_eps))
-        shard = _dot(h_last, w["lm_head"])  # [1, Vp]
+        shard = _dense(w, "lm_head", None, h_last)  # [1, Vp]
         full = lax.all_gather(shard, "tp", axis=1, tiled=True)[0, :V]
         logits = softcap_logits(cfg, full)
         out = (logits, {"k_cache": kc[None], "v_cache": vc[None]})

@@ -116,13 +116,17 @@ WEIGHT_NAMES = (
 )
 
 
-def weight_names(expert_format="int4"):
-    """Kernel operand order: streamed, vector, expert (`layout.expert_families`), lm_head."""
+def weight_names(expert_format="int4", dense_format="bf16"):
+    """Kernel operand order: streamed (`layout.dense_ref_name` of `dense_format`), vector
+    (incl. the int8 scale vectors), expert (`layout.expert_families`), lm_head (+ `lm_head_s`)."""
+    lm = (layout.dense_ref_name("lm_head", dense_format),)
+    if dense_format == "int8":
+        lm += (layout.scale_family("lm_head"),)
     return (
-        layout.STREAMED_FAMILIES
-        + layout.VECTOR_FAMILIES
+        tuple(layout.dense_ref_name(n, dense_format) for n in layout.STREAMED_FAMILIES)
+        + layout.vector_families(dense_format)
         + layout.expert_families(expert_format)
-        + ("lm_head",)
+        + lm
     )
 
 
@@ -249,20 +253,21 @@ def default_hier(batch):
 
 def scratch_shapes(
     cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=False, wire=BF16,
-    banks=layout.BANKS, packed=True, hier=None, expert_format="int4",
+    banks=layout.BANKS, packed=True, hier=None, expert_format="int4", dense_format="bf16",
 ):
     """The kernel's scratch, grouped: `{group: tuple of pltpu.VMEM / semaphores}` in order.
-    `packed=False` (interpret mode) uses plain int4 expert slots; `expert_format` selects the
-    int4 (`moe`) or NVFP4 (`fp4`) expert slots."""
+    `packed=False` (interpret mode) uses plain int4 expert slots and no ring bitcast views;
+    `expert_format` selects the int4 (`moe`) or NVFP4 (`fp4`) expert slots; `dense_format`
+    "int8" makes the ring int8, adds the per-layer scale vectors and the lm_head scale slot."""
     rows, width, gather_width = _collective_geometry(cfg, batch, tp)
     hq, hkv, D = cfg.heads // tp, cfg.kv_heads // tp, cfg.head_dim
     vectors = []
-    shapes = layout.rank_shapes(cfg, tp)
-    for name in layout.VECTOR_FAMILIES:
+    shapes = layout.rank_shapes(cfg, tp, dense_format=dense_format)
+    for name in layout.vector_families(dense_format):
         (_, _, w), dtype = shapes[name]
         vectors += list(stream.vector_scratch(w, dtype))
     groups = {
-        "ring": stream.scratch_shapes(cfg, tp, banks),
+        "ring": stream.scratch_shapes(cfg, tp, banks, dense_format, bitcast=packed),
         "collectives": collectives.scratch_shapes(
             rows, width, tp, gather_rows=8, gather_width=gather_width,
             bf16_wire=wire == BF16, f32_wire=wire == F32,
@@ -281,6 +286,9 @@ def scratch_shapes(
             pltpu.VMEM((batch, cfg.hidden), BF16),  # x_attn
         ),
     }
+    if dense_format == "int8":  # lm_head column scales, fetched once in the prologue
+        vp = layout.vocab_pad(cfg, tp)
+        groups["lm_scale"] = (pltpu.VMEM((1, vp), F32), pltpu.SemaphoreType.DMA((1,)))
     if aux_hidden:
         groups["aux"] = (pltpu.VMEM((batch, cfg.hidden), F32), pltpu.SemaphoreType.DMA((1,)))
     return groups
@@ -320,7 +328,7 @@ def default_geometry(cfg: Config, batch, tp=8, aux_hidden=False, wire=BF16, expe
 
 def vmem_budget(
     cfg: Config, batch, tp=8, moe_slots=None, aux_hidden=False, log=print, wire=BF16,
-    banks=layout.BANKS, hier=None, expert_format="int4",
+    banks=layout.BANKS, hier=None, expert_format="int4", dense_format="bf16",
 ):
     """Explicit VMEM allocations of the kernel in bytes per group (+ `total`), printed via `log`.
 
@@ -331,7 +339,8 @@ def vmem_budget(
     if moe_slots is None:
         moe_slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, banks, expert_format)
     groups = scratch_shapes(
-        cfg, batch, tp, moe_slots, aux_hidden, wire, banks, hier=hier, expert_format=expert_format
+        cfg, batch, tp, moe_slots, aux_hidden, wire, banks, hier=hier, expert_format=expert_format,
+        dense_format=dense_format,
     )
     out = {name: _scratch_bytes(shapes) for name, shapes in groups.items()}
     vp = layout.vocab_pad(cfg, tp)
@@ -346,7 +355,7 @@ def vmem_budget(
         parts = ", ".join(f"{k} {v / MIB:.2f}" for k, v in out.items() if k != "total")
         log(
             f"decode megakernel VMEM budget (B={batch}, {expert_format} experts, "
-            f"moe_slots={moe_slots}, banks={banks}): "
+            f"{dense_format} dense, moe_slots={moe_slots}, banks={banks}): "
             f"{out['total'] / MIB:.2f} MiB of {VMEM_LIMIT / MIB:.0f} [{parts}]"
         )
     return out
@@ -420,14 +429,18 @@ def _kernel_body(cfg: Config, batch, tp, opts):
     L, H, Hm = cfg.layers, cfg.hidden, cfg.moe_hidden
     B = batch
     r16 = stream.r16
-    names = weight_names(opts.expert_format)
+    dfmt = opts.dense_format
+    int8 = dfmt == "int8"
+    names = weight_names(opts.expert_format, dfmt)
     n_weights = len(names)
     xp = _expert_module(opts.expert_format)
     groups = scratch_shapes(
         cfg, B, tp, opts.moe_slots, opts.aux_hidden, opts.wire, opts.banks,
         packed=not opts.interpret, hier=opts.hier, expert_format=opts.expert_format,
+        dense_format=dfmt,
     )
     sizes = {name: len(shapes) for name, shapes in groups.items()}
+    vector_names = layout.vector_families(dfmt)
 
     def body(pos_ref, x0_ref, rope_ref, final_norm_ref, *refs):
         weights = dict(zip(names, refs[:n_weights]))
@@ -444,14 +457,20 @@ def _kernel_body(cfg: Config, batch, tp, opts):
         assert not refs, len(refs)
 
         skip = opts.skip
-        lm_head = None if "lm_head" in skip else weights["lm_head"]
-        ring = stream.make_ring(cfg, scratch["ring"], weights, lm_head, tp=tp)
+        lm_name = layout.dense_ref_name("lm_head", dfmt)
+        lm_head = None if "lm_head" in skip else weights[lm_name]
+        ring = stream.make_ring(
+            cfg, scratch["ring"], weights, lm_head, tp=tp, dense_format=dfmt,
+            bitcast=not opts.interpret,
+        )
         ws = collectives.workspace(
             *scratch["collectives"], f32_wire=opts.wire == F32, hierarchical=opts.hier
         )
         dots = "dense_dots" not in skip
 
         def gemv(x, family, l, **kw):
+            if int8 and family in layout.INT8_DENSE:  # per-column scales of this layer
+                kw["scale"] = v(layout.scale_family(family), l)
             return stream.gemv(ring, x, family, l, compute=dots, **kw)
 
         def all_reduce(x, phase, hierarchical=False):
@@ -469,9 +488,14 @@ def _kernel_body(cfg: Config, batch, tp, opts):
         sc = xp.bind(scratch["moe"])
         experts = xp.weights(weights)
         vec = {}
-        for i, name in enumerate(layout.VECTOR_FAMILIES):
+        for i, name in enumerate(vector_names):
             vec[name] = (weights[name], scratch["vectors"][2 * i], scratch["vectors"][2 * i + 1])
         s_ref, x_ref = scratch["activations"]
+        lm_scale = None
+        if int8:
+            lm_buf, lm_sem = scratch["lm_scale"]
+            lm_scale = pltpu.make_async_copy(weights[layout.scale_family("lm_head")], lm_buf,
+                                             lm_sem.at[0])
 
         def prefetch_vectors(l):
             for hbm, buf, sems in vec.values():
@@ -497,6 +521,8 @@ def _kernel_body(cfg: Config, batch, tp, opts):
         collectives.barrier(tp)
         stream.prime(ring)
         prefetch_vectors(0)
+        if lm_scale is not None:
+            lm_scale.start()
         s0 = x0_ref[...]
         s_ref[...] = s0
         wait_vector("attn_norm", 0)
@@ -506,7 +532,7 @@ def _kernel_body(cfg: Config, batch, tp, opts):
         # ---- layer loop -------------------------------------------------------------------
         def layer(l, carry):
             phase = l * COLLECTIVES_PER_LAYER
-            for name in layout.VECTOR_FAMILIES:
+            for name in vector_names:
                 if name != "attn_norm":  # waited at the end of the previous layer
                     wait_vector(name, l)
 
@@ -604,7 +630,9 @@ def _kernel_body(cfg: Config, batch, tp, opts):
         if "lm_head" in skip:
             logits_ref[:, pl.ds(0, H)] = jnp.broadcast_to(hN.astype(F32)[:1], (LOGIT_ROWS, H))
         else:
-            gemv(hN, "lm_head", L, acc=logits_ref)
+            if lm_scale is not None:
+                lm_scale.wait()
+            gemv(hN, "lm_head", L, acc=logits_ref, scale=lm_buf if int8 else None)
         if "collectives" in skip:
             tokens_ref[...] = jnp.zeros((LOGIT_ROWS, TOKEN_LANES), I32)
         else:
@@ -613,13 +641,18 @@ def _kernel_body(cfg: Config, batch, tp, opts):
     return body, groups
 
 
-def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset(), expert_format="int4"):
+def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset(), expert_format="int4",
+                dense_format="bf16"):
     """Per-rank `kernel(pos, x0, rope, final_norm, weights, k_cache, v_cache) -> (logits [8, Vp]
     f32, tokens [8, 128] i32, k_cache, v_cache[, aux])` around the `pallas_call` (no
     shard_map; `weights` is the per-rank dict without the leading rank axis). Used by
-    `make_decode`."""
+    `make_decode`. `dense_format` (`layout.DENSE_FORMATS`) selects the bf16 or the int8
+    dense projections / lm_head."""
     opts = parse_options(options)
     opts.expert_format = expert_format
+    if dense_format not in layout.DENSE_FORMATS:
+        raise ValueError(f"unknown dense_format {dense_format!r}")
+    opts.dense_format = dense_format
     layout.check_tp(cfg, tp, expert_format)
     if opts.moe_slots is None and opts.banks is None:
         opts.moe_slots, opts.banks = default_geometry(
@@ -647,7 +680,7 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset(), exper
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pl.ANY)
-    names = weight_names(expert_format)
+    names = weight_names(expert_format, dense_format)
     n_weights = len(names)
     k_index = 4 + n_weights
     out_shape = [
@@ -683,7 +716,7 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset(), exper
 
 def make_decode(
     mesh, cfg: Config, context, batch, *, greedy=True, return_logits=False, tp=8,
-    options=frozenset(), expert_format=None,
+    options=frozenset(), expert_format=None, dense_format=None,
 ):
     """Jitted `decode(weights, caches, tokens [B] i32, pos [B] i32) -> (next_tokens [B] i32,
     logits [B, V] f32 or None, caches)` (design.md 5.6); `caches` are donated.
@@ -695,6 +728,8 @@ def make_decode(
     `expert_format` ("int4" / "nvfp4", `layout.EXPERT_FORMATS`) selects the expert kernel;
     None (default) infers it from the family names of `weights` at the first call
     (`layout.expert_format_of`), so the same program serves both container formats.
+    `dense_format` ("bf16" / "int8", `layout.DENSE_FORMATS`) likewise selects the dense
+    projections + lm_head the ring streams (default: `layout.dense_format_of(weights)`).
     """
     if mesh.size != tp:
         raise ValueError(f"mesh has {mesh.size} devices, tp={tp}")
@@ -703,23 +738,25 @@ def make_decode(
     vp = layout.vocab_pad(cfg, tp)
     built = {}
 
-    def kernel_for(fmt):
-        if fmt not in built:
-            kernel, opts = make_kernel(cfg, context, batch, tp=tp, options=options, expert_format=fmt)
+    def kernel_for(fmt, dfmt):
+        if (fmt, dfmt) not in built:
+            kernel, opts = make_kernel(cfg, context, batch, tp=tp, options=options,
+                                       expert_format=fmt, dense_format=dfmt)
             vmem_budget(
                 cfg, batch, tp, opts.moe_slots, opts.aux_hidden, wire=opts.wire,
-                banks=opts.banks, hier=opts.hier, expert_format=fmt,
+                banks=opts.banks, hier=opts.hier, expert_format=fmt, dense_format=dfmt,
             )
-            built[fmt] = (kernel, opts)
-        return built[fmt]
+            built[(fmt, dfmt)] = (kernel, opts)
+        return built[(fmt, dfmt)]
 
-    if expert_format is not None:
-        kernel_for(expert_format)
+    if expert_format is not None and dense_format is not None:
+        kernel_for(expert_format, dense_format)
     aux_hidden = parse_options(options).aux_hidden
 
     def local(weights, caches, tokens, pos):
         fmt = expert_format or layout.expert_format_of(weights)
-        kernel, opts = kernel_for(fmt)
+        dfmt = dense_format or layout.dense_format_of(weights)
+        kernel, opts = kernel_for(fmt, dfmt)
         w = {name: value[0] for name, value in weights.items()}
         kc, vc = caches["k_cache"][0], caches["v_cache"][0]
         rank = lax.axis_index("tp")

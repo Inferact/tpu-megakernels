@@ -87,7 +87,28 @@ def mini_case(mesh):
     sharded = musespark.shard_canonical(cfg, canonical, TP)
     sharding = NamedSharding(mesh, P("tp"))
     weights = {
-        n: jax.device_put(jnp.asarray(musespark.to_device(a)), sharding) for n, a in sharded.items()
+        n: jax.device_put(a, sharding) for n, a in musespark.to_device(sharded).items()
+    }
+    return canonical, musespark.to_device(canonical), weights
+
+
+@pytest.fixture(scope="module")
+def mini_case_int8(mesh):
+    """`mini_case` with int8 per-output-channel dense projections + lm_head
+    (`quantize_dense_canonical`): the reference runs `dot(x, q) * s`, the kernel streams the
+    `_i8` / `_s` families (dense_format inferred from the weight tree)."""
+    cfg = MINI
+    canonical = musespark.quantize_dense_canonical(cfg, make_weights(cfg))
+    sharded = musespark.shard_canonical(cfg, canonical, TP)
+    assert layout.dense_format_of(sharded) == "int8"
+    # the round trip through the per-rank layout is exact
+    back = musespark.unshard(cfg, sharded, TP)
+    for name in ("q_i8", "q_s", "k_i8", "v_s", "o_i8", "o_s", "pre_s", "post_i8", "lm_head_i8",
+                 "lm_head_s"):
+        assert np.array_equal(back[name], canonical[name]), name
+    sharding = NamedSharding(mesh, P("tp"))
+    weights = {
+        n: jax.device_put(a, sharding) for n, a in musespark.to_device(sharded).items()
     }
     return canonical, musespark.to_device(canonical), weights
 
@@ -208,6 +229,11 @@ def test_mini_decode_interpret(mesh, mini_case, batch):
     _run_mini(mesh, mini_case, batch, steps=6, interpret=True, name=f"interpret B={batch}")
 
 
+@pytest.mark.skipif(ON_TPU, reason="interpret-mode test; see test_mini_decode_int8_tpu")
+def test_mini_decode_int8_interpret(mesh, mini_case_int8):
+    _run_mini(mesh, mini_case_int8, 2, steps=6, interpret=True, name="interpret int8 B=2")
+
+
 def test_vmem_budget_real_config():
     cfg = Config()
     # packed int4 slots (3.4 MiB): the 4 default slots fit at every batch with the full ring
@@ -223,6 +249,11 @@ def test_vmem_budget_real_config():
     assert slot == pytest.approx(3.375 * dk.MIB, rel=0.02)  # 2 + 1 MiB packed + 0.375 scales
     assert dk.default_geometry(MINI, 8) == (4, 12)
     assert dk.vmem_budget(MINI, 8)["total"] <= dk.VMEM_EXPLICIT_LIMIT
+    # the int8 ring is the same 24 MiB; scale vectors + lm_head scales add < 0.5 MiB
+    i8 = dk.vmem_budget(cfg, 1, dense_format="int8", expert_format="nvfp4", log=None)
+    b16 = dk.vmem_budget(cfg, 1, dense_format="bf16", expert_format="nvfp4", log=None)
+    assert i8["ring"] == b16["ring"] and 0 < i8["total"] - b16["total"] < dk.MIB // 2
+    assert i8["total"] <= dk.VMEM_EXPLICIT_LIMIT
 
 
 def test_parse_options():
@@ -246,7 +277,23 @@ def test_mini_decode_tpu(mesh, mini_case, batch):
 
 
 @pytest.mark.skipif(not ON_TPU, reason="needs 8 TPU cores")
+@pytest.mark.parametrize("batch", [1, 8])
+def test_mini_decode_int8_tpu(mesh, mini_case_int8, batch):
+    _run_mini(mesh, mini_case_int8, batch, steps=16, interpret=False, name=f"tpu int8 B={batch}")
+
+
+@pytest.mark.skipif(not ON_TPU, reason="needs 8 TPU cores")
+def test_prefill_then_kernel_decode_int8_tpu(mesh, mini_case_int8):
+    """XLA prefill (`prefill._dense`: dot(x, q) * s) + kernel decode on the int8 MINI case."""
+    _prefill_then_decode(mesh, mini_case_int8, "prefill+decode int8")
+
+
+@pytest.mark.skipif(not ON_TPU, reason="needs 8 TPU cores")
 def test_prefill_then_kernel_decode_tpu(mesh, mini_case):
+    _prefill_then_decode(mesh, mini_case, "prefill+decode")
+
+
+def _prefill_then_decode(mesh, mini_case, name):
     cfg = MINI
     canonical, canonical_dev, weights = mini_case
     steps, batch = 8, 2
@@ -272,8 +319,8 @@ def test_prefill_then_kernel_decode_tpu(mesh, mini_case):
         mesh, cfg, CONTEXT, batch, return_logits=True, options=frozenset({"aux_hidden"})
     )
     got, caches = _kernel_steps(decode, weights, caches, extra, positions)
-    _compare_steps("prefill+decode", cfg, ref, got, steps)
-    _compare_caches("prefill+decode", cfg, caches, ref_caches, batch, T_PREFILL + steps)
+    _compare_steps(name, cfg, ref, got, steps)
+    _compare_caches(name, cfg, caches, ref_caches, batch, T_PREFILL + steps)
 
 
 def random_rank_weights(mesh, cfg, tp=TP, seed=0):

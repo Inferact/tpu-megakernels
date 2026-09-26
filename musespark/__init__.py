@@ -39,6 +39,13 @@ Canonical (unsharded) weight dict, all matrices `[in, out]` (`y = x @ W`), layer
       down_q         [L, E, I, Hm]  int4
       down_s         [L, E, I/G, Hm] f32
 
+    dense projections, OPTIONALLY int8 per-output-channel (`quantize_dense_canonical`, the
+    container's `dense_format int8`; the bf16 entries above are then absent):
+      q_i8, k_i8, v_i8, gate_i8, pre_i8, post_i8  int8 of the bf16 shape, `*_s` f32 `[L, 1, N]`
+      o_i8 [L, nH*D, H] int8, o_s [L, 1, H] f32 (scales over the full contraction axis)
+      lm_head_i8 [H, V] int8, lm_head_s [1, V] f32
+      used as `r16(dot(bf16(x), bf16(q)) * s)` (`dense`), the kernel's int8 maths.
+
 The reference dequantizes on the fly (`dequantize_int4(...).astype(bf16)`), so one model serves
 both "exact vs PyTorch" (dense bf16) and "same weights as the kernel" (quantized) comparisons.
 KV caches are `(k, v)` with shape `[L, B, context, nKV, D]` bf16, token at position `p` in
@@ -60,6 +67,7 @@ from musespark.quant import (
     dequant_fp4_jnp,
     dequantize_int4,
     quantize_int4,
+    quantize_int8,
     scales_from_chunked,
     scales_to_chunked,
 )
@@ -69,6 +77,8 @@ __all__ = [
     "Config",
     "decode_step",
     "decoder_layer",
+    "dense",
+    "quantize_dense_canonical",
     "eff_weight",
     "embed",
     "forward",
@@ -124,7 +134,11 @@ LAYER_NAMES = (
     "down_fp4",
     "down_bs",
     "expert_gs",
+    "q_i8", "q_s", "k_i8", "k_s", "v_i8", "v_s", "gate_i8", "gate_s", "o_i8", "o_s",
+    "pre_i8", "pre_s", "post_i8", "post_s",
 )
+# canonical dense matrices with an int8 twin (`quantize_dense_canonical`)
+DENSE_CANONICAL = ("q", "k", "v", "gate", "o", "pre", "post", "lm_head")
 
 
 # ---- rounding / numeric helpers ---------------------------------------------------------------
@@ -143,6 +157,20 @@ def rms(x, weight=None, eps=1e-5):
 def mm(x, w):
     """bf16 x bf16 GEMM, f32 accumulation, bf16-rounded output (returned as f32)."""
     return r16(jnp.dot(x.astype(BF16), w.astype(BF16), preferred_element_type=F32))
+
+
+def dense(w, name, x, rounded=True):
+    """`x @ W[name]` for a dense matrix of dict `w` in either dense format: `mm` on the bf16
+    entry, or `dot(bf16(x), bf16(q)) * s` on the int8 pair `name_i8` / `name_s` (exact int8 ->
+    bf16 conversion, f32 accumulation, per-column scale -- the kernel's maths). `rounded`
+    applies the branch-output `r16` (the raw lm_head logits are not rounded)."""
+    q = w.get(f"{name}_i8")
+    if q is None:
+        y = jnp.dot(x.astype(BF16), jnp.asarray(w[name]).astype(BF16), preferred_element_type=F32)
+    else:
+        y = jnp.dot(x.astype(BF16), jnp.asarray(q).astype(BF16), preferred_element_type=F32)
+        y = y * jnp.asarray(w[f"{name}_s"], F32)
+    return r16(y) if rounded else y
 
 
 def gate_coeffs(gate, temperature=0.3):
@@ -251,10 +279,10 @@ def attention_branch(cfg, lw, x_attn, positions, k_cache, v_cache, layer):
     """
     B, T, _ = x_attn.shape
     nH, nKV, D = cfg.heads, cfg.kv_heads, cfg.head_dim
-    q = mm(x_attn, lw["q"]).reshape(B, T, nH, D)
-    k = mm(x_attn, lw["k"]).reshape(B, T, nKV, D)
-    v = mm(x_attn, lw["v"]).reshape(B, T, nKV, D)
-    g = mm(x_attn, lw["gate"]).reshape(B, T, nH, D)
+    q = dense(lw, "q", x_attn).reshape(B, T, nH, D)
+    k = dense(lw, "k", x_attn).reshape(B, T, nKV, D)
+    v = dense(lw, "v", x_attn).reshape(B, T, nKV, D)
+    g = dense(lw, "gate", x_attn).reshape(B, T, nH, D)
     q = r16(rms(q, None, cfg.rms_eps))  # parameter-free per-head QK norm, eps = rms_eps
     k = r16(rms(k, None, cfg.rms_eps))
     if not cfg.is_full_attention(layer):  # full-attention layers are NoPE
@@ -277,7 +305,7 @@ def attention_branch(cfg, lw, x_attn, positions, k_cache, v_cache, layer):
     o = jnp.einsum("bkgts,bskd->btkgd", p, v_cache.astype(F32), precision=HIGHEST)
     o = o.reshape(B, T, nH, D)
     o = rms(o, None, cfg.rms_eps) * jax.nn.sigmoid(g)  # per-head norm, per-channel sigmoid gate
-    attn_out = mm(r16(o).reshape(B, T, nH * D), lw["o"])
+    attn_out = dense(lw, "o", r16(o).reshape(B, T, nH * D))
     return attn_out, k_cache, v_cache
 
 
@@ -287,7 +315,7 @@ def moe_branch(cfg, lw, x_ffn):
     # Router: fp32 x fp32 IEEE GEMM on the 8192-wide pre-FFN norm output.
     logits = jnp.dot(x_ffn, jnp.asarray(lw["router"], F32), precision=HIGHEST)
     idx, w = route(logits * cfg.output_multiplier, lw["router_bias"], cfg.top_k, cfg.route_eps)
-    h1 = r16(rms(mm(x_ffn, lw["pre"]), lw["pre_expert_norm"], cfg.rms_eps))  # [B, T, Hm]
+    h1 = r16(rms(dense(lw, "pre", x_ffn), lw["pre_expert_norm"], cfg.rms_eps))  # [B, T, Hm]
     gate_up, down = expert_weights(lw)
     w_post = jnp.asarray(lw["post_expert_norm"], F32)
     m = jnp.zeros(h1.shape, F32)
@@ -301,7 +329,7 @@ def moe_branch(cfg, lw, x_ffn):
         t = r16(y * w_post)  # post_expert_norm: weight BEFORE the norm, no weight after
         yn = t * lax.rsqrt(jnp.mean(t * t, axis=-1, keepdims=True) + cfg.post_eps)
         m = m + w[..., slot : slot + 1] * yn
-    return mm(r16(m), lw["post"])
+    return dense(lw, "post", r16(m))
 
 
 def decoder_layer(cfg, lw, s, x_attn, positions, k_cache, v_cache, layer):
@@ -351,7 +379,7 @@ def forward(cfg, weights, tokens, start_positions, caches, return_hidden=False):
         if layer + 1 < cfg.layers:
             x = r16(rms(s, weights["attn_norm"][layer + 1], cfg.rms_eps))
     hN = r16(rms(r16(s), weights["final_norm"], cfg.rms_eps))  # final norm weight as-is (no +1)
-    raw = jnp.dot(hN.astype(BF16), jnp.asarray(weights["lm_head"]), preferred_element_type=F32)
+    raw = dense(weights, "lm_head", hN, rounded=False)
     logits = softcap_logits(cfg, raw)
     if return_hidden:
         return logits, (k_cache, v_cache), jnp.stack(hidden)
@@ -452,15 +480,31 @@ def random_canonical_weights(cfg, key=0, quantized=True):
 
 
 def to_device(tree):
-    """numpy canonical dict -> jax arrays (int8 expert values become int4)."""
+    """numpy canonical dict -> jax arrays (the int8-valued int4 experts `gate_up_q` / `down_q`
+    become `jnp.int4`; int8 dense entries stay int8)."""
 
-    def put(a):
+    def put(name, a):
         a = np.asarray(a)
-        if a.dtype == np.int8:
-            a = a.astype(jnp.int4)
+        if a.dtype == np.int8 and name in (None, "gate_up_q", "down_q"):
+            a = a.astype(jnp.int4)  # a bare int8 array is taken to be int4 expert values
         return jnp.asarray(a)
 
-    return jax.tree.map(put, tree)
+    if isinstance(tree, dict):
+        return {name: put(name, a) for name, a in tree.items()}
+    return put(None, tree)
+
+
+def quantize_dense_canonical(cfg, weights):
+    """Canonical dict -> the same dict with the dense projections and the lm_head replaced by
+    their int8 per-output-channel pairs (`quant.quantize_int8` over the FULL contraction axis,
+    one f32 scale per output column). Sharding this dict (`shard_canonical`) gives exactly the
+    per-rank int8 families `musespark.load.quantize_dense` writes from the bf16 container
+    (column shards keep their columns' scales; `o` is row-sharded and every rank gets `o_s`)."""
+    out = {k: v for k, v in weights.items() if k not in DENSE_CANONICAL}
+    for name in DENSE_CANONICAL:
+        q, s = quantize_int8(np.asarray(weights[name]))
+        out[f"{name}_i8"], out[f"{name}_s"] = q, s
+    return out
 
 
 def split_hi_lo(w):
@@ -565,16 +609,6 @@ def shard_layer(cfg, lw, rank, tp=8):
     gu_cols = np.r_[r * isl : (r + 1) * isl, I + r * isl : I + (r + 1) * isl]
     G = cfg.group_size
     out = {
-        "attn_norm": np.asarray(lw["attn_norm"], NP_BF16)[None],
-        "ffn_norm": np.asarray(lw["ffn_norm"], NP_BF16)[None],
-        "post_ffn_norm": np.asarray(lw["post_ffn_norm"], NP_BF16)[None],
-        "attn_gate_alpha": np.asarray(lw["attn_gate_alpha"], np.float32)[None],
-        "attn_gate_beta": np.asarray(lw["attn_gate_beta"], np.float32)[None],
-        "ffn_gate_alpha": np.asarray(lw["ffn_gate_alpha"], np.float32)[None],
-        "ffn_gate_beta": np.asarray(lw["ffn_gate_beta"], np.float32)[None],
-        "pre_expert_norm": np.asarray(lw["pre_expert_norm"], NP_BF16)[None],
-        "post_expert_norm": np.asarray(lw["post_expert_norm"], NP_BF16)[None],
-        "router_bias": np.asarray(lw["router_bias"], np.float32)[None],
         "q": np.asarray(lw["q"], NP_BF16)[:, r * qw : (r + 1) * qw],
         "kv": np.concatenate(
             (
@@ -589,6 +623,32 @@ def shard_layer(cfg, lw, rank, tp=8):
         "router_hi": hi,
         "router_lo": lo,
         "post": np.asarray(lw["post"], NP_BF16)[:, r * (H // tp) : (r + 1) * (H // tp)],
+    } if "q_i8" not in lw else {
+        "q_i8": lw["q_i8"][:, r * qw : (r + 1) * qw],
+        "q_s": lw["q_s"][:, r * qw : (r + 1) * qw],
+        "kv_i8": np.concatenate(
+            (lw["k_i8"][:, r * kvw : (r + 1) * kvw], lw["v_i8"][:, r * kvw : (r + 1) * kvw]), axis=1
+        ),
+        "kv_s": np.concatenate(
+            (lw["k_s"][:, r * kvw : (r + 1) * kvw], lw["v_s"][:, r * kvw : (r + 1) * kvw]), axis=1
+        ),
+        "gate_i8": lw["gate_i8"][:, r * qw : (r + 1) * qw],
+        "gate_s": lw["gate_s"][:, r * qw : (r + 1) * qw],
+        "o_i8": lw["o_i8"][r * qw : (r + 1) * qw, :],
+        "o_s": lw["o_s"],
+        "pre_i8": lw["pre_i8"][:, r * (Hm // tp) : (r + 1) * (Hm // tp)],
+        "pre_s": lw["pre_s"][:, r * (Hm // tp) : (r + 1) * (Hm // tp)],
+        "router_hi": hi,
+        "router_lo": lo,
+        "post_i8": lw["post_i8"][:, r * (H // tp) : (r + 1) * (H // tp)],
+        "post_s": lw["post_s"][:, r * (H // tp) : (r + 1) * (H // tp)],
+    }
+    out = {
+        **out,
+        **{k: np.asarray(lw[k], NP_BF16)[None] for k in
+           ("attn_norm", "ffn_norm", "post_ffn_norm", "pre_expert_norm", "post_expert_norm")},
+        **{k: np.asarray(lw[k], np.float32)[None] for k in
+           ("attn_gate_alpha", "attn_gate_beta", "ffn_gate_alpha", "ffn_gate_beta", "router_bias")},
         "gate_up_q": _np(gate_up_q[:, :, gu_cols]),
         "gate_up_s": scales_to_chunked(gate_up_s[:, :, gu_cols], Hm),
         "down_q": _np(np.asarray(lw["down_q"])[:, r * isl : (r + 1) * isl, :]),
@@ -605,15 +665,22 @@ def shard_global(cfg, weights, rank, tp=8):
     lo, hi = rank * vp, min((rank + 1) * vp, cfg.vocab)
     n = max(hi - lo, 0)
     embed_ = np.zeros((vp, cfg.hidden), NP_BF16)
-    lm = np.zeros((cfg.hidden, vp), NP_BF16)
     if n:
         embed_[:n] = np.asarray(weights["embed"], NP_BF16)[lo:hi]
-        lm[:, :n] = np.asarray(weights["lm_head"], NP_BF16)[:, lo:hi]
-    return {
-        "embed": embed_,
-        "lm_head": lm,
-        "final_norm": np.asarray(weights["final_norm"], NP_BF16)[None],
-    }
+    out = {"embed": embed_, "final_norm": np.asarray(weights["final_norm"], NP_BF16)[None]}
+    if "lm_head_i8" in weights:  # padded columns: q = 0, scale = 1 (like `load.quantize_dense`)
+        lm = np.zeros((cfg.hidden, vp), np.int8)
+        lm_s = np.ones((1, vp), np.float32)
+        if n:
+            lm[:, :n] = np.asarray(weights["lm_head_i8"])[:, lo:hi]
+            lm_s[:, :n] = np.asarray(weights["lm_head_s"], np.float32)[:, lo:hi]
+        out["lm_head_i8"], out["lm_head_s"] = lm, lm_s
+    else:
+        lm = np.zeros((cfg.hidden, vp), NP_BF16)
+        if n:
+            lm[:, :n] = np.asarray(weights["lm_head"], NP_BF16)[:, lo:hi]
+        out["lm_head"] = lm
+    return out
 
 
 def shard_rank(cfg, weights, rank, tp=8):
@@ -624,7 +691,7 @@ def shard_rank(cfg, weights, rank, tp=8):
     ]
     for name in per_layer[0]:
         out[name] = np.stack([lw[name] for lw in per_layer])
-    shapes = layout.rank_shapes(cfg, tp)
+    shapes = layout.rank_shapes(cfg, tp, dense_format="int8" if "q_i8" in weights else "bf16")
     for name, (shape, dtype) in shapes.items():
         if out[name].shape != shape or out[name].dtype != np.dtype(dtype):
             raise ValueError(
@@ -647,19 +714,34 @@ def unshard(cfg, sharded, tp=8):
     kvw = cfg.kv_width // tp
     out = {
         "embed": s["embed"].reshape(-1, H)[: cfg.vocab],
-        "lm_head": np.concatenate(list(s["lm_head"]), axis=1)[:, : cfg.vocab],
+        "lm_head": (np.concatenate(list(s["lm_head"]), axis=1)[:, : cfg.vocab]
+                    if "lm_head" in s else None),
         "final_norm": s["final_norm"][0, 0],
     }
     for name in layout.VECTOR_FAMILIES:
         out[name] = s[name][0, :, 0]
     out["router"] = s["router_hi"][0].astype(np.float32) + s["router_lo"][0].astype(np.float32)
-    out["q"] = np.concatenate(list(s["q"]), axis=2)
-    out["gate"] = np.concatenate(list(s["gate"]), axis=2)
-    out["k"] = np.concatenate([r[:, :, :kvw] for r in s["kv"]], axis=2)
-    out["v"] = np.concatenate([r[:, :, kvw:] for r in s["kv"]], axis=2)
-    out["o"] = np.concatenate(list(s["o"]), axis=1)
-    out["pre"] = np.concatenate(list(s["pre"]), axis=2)
-    out["post"] = np.concatenate(list(s["post"]), axis=2)
+    if "q_i8" in s:
+        out["lm_head_i8"] = np.concatenate(list(s["lm_head_i8"]), axis=1)[:, : cfg.vocab]
+        out["lm_head_s"] = np.concatenate(list(s["lm_head_s"]), axis=1)[:, : cfg.vocab]
+        del out["lm_head"]
+        for name in ("q", "gate", "pre", "post"):
+            out[name + "_i8"] = np.concatenate(list(s[name + "_i8"]), axis=2)
+            out[name + "_s"] = np.concatenate(list(s[name + "_s"]), axis=2)
+        out["k_i8"] = np.concatenate([r[:, :, :kvw] for r in s["kv_i8"]], axis=2)
+        out["k_s"] = np.concatenate([r[:, :, :kvw] for r in s["kv_s"]], axis=2)
+        out["v_i8"] = np.concatenate([r[:, :, kvw:] for r in s["kv_i8"]], axis=2)
+        out["v_s"] = np.concatenate([r[:, :, kvw:] for r in s["kv_s"]], axis=2)
+        out["o_i8"] = np.concatenate(list(s["o_i8"]), axis=1)
+        out["o_s"] = s["o_s"][0]
+    else:
+        out["q"] = np.concatenate(list(s["q"]), axis=2)
+        out["gate"] = np.concatenate(list(s["gate"]), axis=2)
+        out["k"] = np.concatenate([r[:, :, :kvw] for r in s["kv"]], axis=2)
+        out["v"] = np.concatenate([r[:, :, kvw:] for r in s["kv"]], axis=2)
+        out["o"] = np.concatenate(list(s["o"]), axis=1)
+        out["pre"] = np.concatenate(list(s["pre"]), axis=2)
+        out["post"] = np.concatenate(list(s["post"]), axis=2)
     gus = [scales_from_chunked(r) for r in s["gate_up_s"]]
     out["gate_up_q"] = np.concatenate(
         [r[..., :isl] for r in s["gate_up_q"]] + [r[..., isl:] for r in s["gate_up_q"]], axis=-1

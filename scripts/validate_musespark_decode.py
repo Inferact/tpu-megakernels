@@ -58,25 +58,29 @@ MIB = float(1 << 20)
 # --------------------------------------------------------------------------------------
 # HBM floor
 # --------------------------------------------------------------------------------------
-def hbm_floor_ms(cfg, batch, tp=TP, expert_format="int4"):
+def hbm_floor_ms(cfg, batch, tp=TP, expert_format="int4", dense_format="bf16"):
     """Bytes one core must read per decode step and the implied floor in ms.
 
-    Dense per layer (bf16, per rank): q, kv, gate, o, pre, post, router hi/lo; experts: the
-    routed experts' int4 gate_up + down with their scales, at most `top_k * batch` distinct
-    (the upper bound, so the floor at B > 1 is slightly pessimistic); lm_head per rank.
+    Dense per layer (per rank, bf16 or the int8 pairs of `dense_format`): q, kv, gate, o, pre,
+    post, router hi/lo; experts: the routed experts' gate_up + down with their scales, at most
+    `top_k * batch` distinct (the upper bound, so the floor at B > 1 is slightly pessimistic);
+    lm_head per rank.
     """
-    shapes = layout.rank_shapes(cfg, tp, expert_format)
+    shapes = layout.rank_shapes(cfg, tp, expert_format, dense_format)
 
     def nbytes(name):
         shape, dtype = shapes[name]
         item = 0.5 if jnp.dtype(dtype) == jnp.dtype(jnp.int4) else jnp.dtype(dtype).itemsize
         return int(np.prod(shape)) * item
 
-    dense = sum(nbytes(n) for n in layout.STREAMED_FAMILIES if n != "lm_head")  # all layers
+    dense = sum(nbytes(layout.dense_ref_name(n, dense_format)) for n in layout.STREAMED_FAMILIES)
+    dense += sum(nbytes(n) for n in layout.dense_scale_families(dense_format))  # all layers
     families = layout.expert_families(expert_format)
     per_expert = sum(nbytes(n) for n in families) / (cfg.layers * cfg.experts)
     experts = per_expert * min(cfg.top_k * batch, cfg.experts) * cfg.layers
-    lm_head = nbytes("lm_head")
+    lm_head = nbytes(layout.dense_ref_name("lm_head", dense_format))
+    if dense_format == "int8":
+        lm_head += nbytes("lm_head_s")
     total = dense + experts + lm_head
     return {
         "dense_mib": dense / MIB,
@@ -101,15 +105,22 @@ class Harness:
         if len(devices) < TP:
             raise RuntimeError(f"need {TP} TPU devices, found {len(devices)}")
         self.mesh = jax.sharding.Mesh(np.asarray(devices[:TP]), ("tp",))
-        self.doc = ms_load.read_layout(args.weights)
+        self.doc = ms_load.effective_layout(args.weights)
         self.cfg = ms_load.config_from_layout(self.doc)
         self.expert_format = ms_load.layout_expert_format(self.doc)
+        self.dense_format = getattr(args, "dense_format", None) or ms_load.layout_dense_format(self.doc)
         self.tokenizer = ms_load.load_tokenizer(args.checkpoint)
         self.prompts = self.load_prompts()
-        log(f"loading weights from {args.weights} ({self.doc['total_bytes'] / 1e9:.0f} GB, "
-            f"{self.expert_format} experts)")
+        names = ms_load.weight_array_names(self.doc, self.dense_format)
+        total = self.doc["tp"] * sum(self.doc["arrays"][n]["nbytes"] for n in names)
+        log(f"loading weights from {args.weights} ({total / 1e9:.0f} GB, {self.expert_format} "
+            f"experts, {self.dense_format} dense; container offers "
+            f"{ms_load.layout_dense_formats(self.doc)})")
         t0 = time.perf_counter()
-        self.weights = ms_load.load_presharded(self.mesh, args.weights, self.cfg, log=lambda _: None)
+        self.weights = ms_load.load_presharded(
+            self.mesh, args.weights, self.cfg, log=lambda _: None, dense_format=self.dense_format
+        )
+        assert layout.dense_format_of(self.weights) == self.dense_format
         self.load_seconds = time.perf_counter() - t0
         log(f"weights resident in {self.load_seconds:.0f} s")
         self.decoders = {}
@@ -501,7 +512,7 @@ def task_bench(h: Harness):
         ms = 1e3 * seconds / steps
         best_ms = 1e3 * min(per_call) / args.steps_per_call
         worst_ms = 1e3 * max(per_call) / args.steps_per_call
-        floor = hbm_floor_ms(cfg, batch, expert_format=h.expert_format)
+        floor = hbm_floor_ms(cfg, batch, expert_format=h.expert_format, dense_format=h.dense_format)
         row = {
             "batch": batch,
             "steps": steps,
@@ -547,6 +558,8 @@ def main(argv=None):
     parser.add_argument("--checkpoint", default=V.DEFAULT_CHECKPOINT)
     parser.add_argument("--ref", default=V.DEFAULT_OUT, help="oracle directory")
     parser.add_argument("--context", type=int, default=4096)
+    parser.add_argument("--dense-format", default=None, choices=list(layout.DENSE_FORMATS),
+                        help="bf16 or int8 dense projections (default: the container's preferred)")
     parser.add_argument("--tasks", default="replay,generate,bench")
     parser.add_argument("--replay-prompts", default="0,3")
     parser.add_argument(

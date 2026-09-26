@@ -535,6 +535,25 @@ def weight_array_names(doc, dense_format=None):
     return [name for name in doc["arrays"] if name not in skip]
 
 
+def effective_layout(directory, doc=None):
+    """`layout.json`, or -- when `quantize_dense(..., publish=False)` completed the int8
+    families without publishing them -- the document `quantize_dense` would publish, so an
+    explicit `dense_format="int8"` can already load them."""
+    directory = Path(directory)
+    doc = doc or read_layout(directory)
+    state = read_progress(directory).get("dense_int8") or {}
+    if "int8" in layout_dense_formats(doc) or not state.get("complete"):
+        return doc
+    cfg, tp = config_from_layout(doc), doc["tp"]
+    full = make_layout(cfg, tp, doc.get("revision"), layout_expert_format(doc),
+                       doc.get("expert_source"), dense_formats=("bf16", "int8"))
+    out = dict(doc)
+    out["arrays"], out["total_bytes"] = full["arrays"], full["total_bytes"]
+    out["dense_formats"], out["int8"] = full["dense_formats"], full["int8"]
+    out["dense_format"] = layout_dense_format(doc)  # unpublished: bf16 stays preferred
+    return out
+
+
 def config_from_layout(doc):
     c = dict(doc["config"])
     c["eos"] = tuple(c["eos"])
@@ -947,9 +966,12 @@ def load_presharded(mesh, directory, cfg=None, *, ranks_in_flight=8, layer_chunk
     doc = read_layout(directory)
     if not read_progress(directory).get("complete"):
         raise ValueError(f"{directory}: conversion is not complete (see progress.json)")
+    if dense_format == "int8":
+        doc = effective_layout(directory, doc)
     tp = doc["tp"]
     fmt = layout_expert_format(doc)
-    expected = make_layout(cfg, tp, expert_format=fmt, dense_formats=layout_dense_formats(doc))
+    if cfg is not None:
+        expected = make_layout(cfg, tp, expert_format=fmt, dense_formats=layout_dense_formats(doc))
     if cfg is not None and expected["arrays"] != doc["arrays"]:
         raise ValueError(f"{directory}: container layout does not match the requested config")
     names = weight_array_names(doc, dense_format)

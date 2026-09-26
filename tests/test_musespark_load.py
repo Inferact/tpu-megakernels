@@ -254,7 +254,11 @@ def test_quantize_dense_v1(converted, tmp_path):
     progress = load.quantize_dense(dst, workers=2, log=quiet, publish=False)
     assert progress["dense_int8"]["complete"]
     assert load.layout_dense_formats(load.read_layout(dst)) == ("bf16",)  # held back
+    eff = load.effective_layout(dst)  # ... but an explicit int8 load already works
+    assert load.layout_dense_formats(eff) == ("bf16", "int8") and load.layout_dense_format(eff) == "bf16"
+    assert set(load.weight_array_names(eff, "int8")) == set(layout.rank_shapes(MINI, TP, dense_format="int8"))
     load.quantize_dense(dst, workers=1, log=quiet)  # nothing to do: publishes
+    assert load.effective_layout(dst) == load.read_layout(dst)
     arrays = _check_int8_container(dst, expected)
     # idempotent
     stamp = load.rank_file(dst, 0, "q_i8").stat().st_mtime_ns
