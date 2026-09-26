@@ -174,6 +174,8 @@ converters run detached (`logs/convert*.log`) and are resumable:
 ```bash
 bash scripts/convert_musespark.sh          # bf16 snapshot -> int4 g128 container (format v1, 471 GB)
 bash scripts/convert_musespark_nvfp4.sh    # vendor NVFP4 Hub repo -> NVFP4 container (format v2, 496 GB)
+JAX_PLATFORMS=cpu .venv/bin/python -m musespark.load quantize-dense \
+    --dir /filestore/weights/muse-spark-tp8-nvfp4   # + int8 dense projections / lm_head in place (24 s, +19 GB)
 ```
 
 They read their locations from the environment or the untracked `.env`:
@@ -224,7 +226,7 @@ pure-JAX reference on the MINI configuration (4 layers, 16 experts, same code):
 
 ```bash
 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=8 \
-  .venv/bin/python -m pytest tests/test_musespark_*.py -q       # 147 passed, 22 skipped
+  .venv/bin/python -m pytest tests/test_musespark_*.py -q       # 181 passed, 29 skipped, 9 warnings in 519 s (commit b171b4d)
 ```
 
 On the TPU host the same files run on hardware: component tests
@@ -248,44 +250,54 @@ official sglang layer maths on CPU.
 ### Results
 
 Decode at context 4096, every row a 151-token prompt, 128 timed steps of 16 per
-device call (`scripts/validate_musespark_decode.py --tasks bench`; int4:
-`logs/validate_musespark_decode_20260926T052025Z.log`, NVFP4:
-`logs/validate_musespark_decode_20260926T051551Z.log`):
+device call (`scripts/validate_musespark_decode.py --tasks bench`, commit `b171b4d`
+kernel; NVFP4 + int8 dense: `logs/validate_musespark_decode_20260926T083121Z.log`,
+NVFP4 + bf16 dense: `..._20260926T070309Z.log`, int4 (bf16 dense):
+`..._20260926T052025Z.log`; `logs/` is untracked, see `musespark/REPRODUCE.md`):
 
-| batch | int4 g128 ms/step | tokens/s (aggregate) | NVFP4 ms/step | tokens/s (aggregate) |
-|------:|------------------:|---------------------:|--------------:|---------------------:|
-| 1     | 3.59 | 278   | 3.82  | 262 |
-| 2     | 3.71 | 540   | 6.98  | 287 |
-| 4     | 3.91 | 1,022 | 6.60  | 606 |
-| 8     | 4.29 | 1,864 | 10.40 | 769 |
+| batch | NVFP4 + int8 dense ms/step | tokens/s (aggregate) | NVFP4 + bf16 dense ms/step | tokens/s | int4 g128 ms/step | tokens/s |
+|------:|---------------------------:|---------------------:|---------------------------:|---------:|------------------:|---------:|
+| 1     | **3.26** | **307** | 3.57 | 281   | 3.59 | 278   |
+| 2     | 3.66 | 547   | 4.07 | 491   | 3.71 | 540   |
+| 4     | 4.25 | 942   | 4.63 | 865   | 3.91 | 1,022 |
+| 8     | 4.46 | 1,793 | 4.86 | 1,646 | 4.29 | 1,864 |
 
-At batch 1 the int4 step reads 7.0 GB per core, a 2.19 ms floor at 3.2 TB/s (61 %
-bandwidth utilisation); the first kernel version took 4.53 ms. NVFP4 matches int4
-at batch 1 (the expert phase stays HBM-bound) but its block-16 scale dots become
-MXU-bound at larger batches, the main open item. `scripts/benchmark_musespark.sh`
-(the demo's `--bench`, 64 steps per call) measures 3.64 / 3.81 / 4.01 / 4.36 ms on
-the int4 container. Prefill of a 192-token prompt takes 462 ms (int4) and 317 ms
-(NVFP4, Pallas dequantization).
+The final configuration is the NVFP4 container with the int8 dense projections
+and `lm_head` (its default `dense_format` after `quantize-dense`): 3.260 ms/step
+at batch 1 = 306.8 tokens/s per row. The int8 families halve the dense bytes
+(42 MiB per layer, `lm_head` 200 MiB); the harness's HBM floor is then 1.47 ms at
+batch 1 (45 % utilisation) and the dense phase is MXU-bound. With bf16 dense the
+int4 step reads 7.0 GB per core, a 2.19 ms floor at 3.2 TB/s (61 %); the first
+kernel version took 4.53 ms. NVFP4 experts are 4-8.5 % slower than int4 at batch
+4 / 8 (block-16 scale dots at the MXU floor of the exact formulation, see
+`musespark/REPORT.md` section 6). `scripts/benchmark_musespark.sh` (the demo's
+`--bench`, 64 steps per call) measures 3.64 / 3.81 / 4.01 / 4.36 ms on the int4
+container at an earlier commit. Prefill of a 192-token prompt takes 462 ms
+(int4), 317 ms (NVFP4, Pallas dequantization) and 313 ms (NVFP4 + int8).
 
-GSM8K (`gsm8k_cot`, 5-shot, chat template, greedy, medium reasoning effort, up to
-8192 generated tokens, the first 100 test problems of lm-evaluation-harness
-through the OpenAI server, `scripts/eval_musespark_gsm8k.sh`):
+GSM8K (lm-evaluation-harness through the OpenAI server, chat template, medium
+reasoning effort, up to 8192 generated tokens, `scripts/eval_musespark_gsm8k.sh`,
+run directories under `eval-results/`):
 
-| container | flexible-extract | strict-match | truncated at the budget |
-|-----------|-----------------:|-------------:|------------------------:|
-| int4 g128 | 87 % | 53 % | 5 / 100 |
-| NVFP4     | 92 % | 57 % | 1 / 100 |
+| run | container | task / decoding | problems | flexible-extract | strict-match | truncated |
+|-----|-----------|-----------------|---------:|-----------------:|-------------:|----------:|
+| **final** | NVFP4 + int8 dense | `gsm8k_cot_llama` 8-shot, vendor sampling (T 1.0, top-k 64, top-p 1.0, seed 0) | 200 | **97.5 %** | **97.5 %** | 0 |
+| **final** | NVFP4 + int8 dense | `gsm8k_cot_llama` 8-shot, greedy | 200 | 95.5 % | **97.5 %** | 0 |
+| earlier | NVFP4 (bf16 dense) | `gsm8k_cot_llama` 8-shot, vendor sampling / greedy | 100 | 98 % / 97 % | 98 % / 97 % | 0 |
+| diagnosis | NVFP4 (bf16 dense) | `gsm8k_cot` 5-shot, greedy | 100 | 92 % | 57 % | 1 |
+| diagnosis | int4 g128 | `gsm8k_cot` 5-shot, greedy | 100 | 87 % | 53 % | 5 |
 
-Caveat: flexible-extract scores the *last* number of the answer, so answers
-that end with a trailing remark, a unit or an alternative reading are counted
-wrong although they contain the gold number (7 of the int4 misses), and
-strict-match requires the literal "The answer is N." that the model rarely
-writes. The truncated transcripts reach the right answer in the reasoning
-channel and then loop until the budget (a greedy-decoding attractor of this
-checkpoint, present at low reasoning effort too). No arithmetic errors were found
-in either container; excluding truncations and extraction misses both are at
-~99 %. Details per run are in the untracked `eval-results/` output
-(`eval-results/gsm8k_diagnosis.md`).
+The > 97 % target is met with the checkpoint's default sampling and by
+strict-match under greedy decoding; greedy flexible-extract is 95.5 % because the
+metric scores the *last* number of the answer and eight of the nine misses end
+with a hedged alternative after "The final answer is N" (the gold number is in
+the text; strict-match accepts four of them), the ninth is an off-by-one. The
+`gsm8k_cot` prompt has no terminal phrase, which is what produced the greedy
+self-talk loops (truncated transcripts reach the right answer in the reasoning
+channel and then loop until the budget) and the last-number extraction misses of
+the diagnosis runs; no false arithmetic step was found in 400 greedy transcripts.
+Details per run: `eval-results/gsm8k_diagnosis.md`, `musespark/REPORT.md`
+section 5.
 
 ### Source layout (`musespark/`)
 

@@ -413,8 +413,9 @@ plus ~70 us of dispatch, XLA glue and the barrier.
   rope equivalence, routing ties), `_quant.py`, `_layout.py`, `_load.py`
   (container round trips), `_tokenizer.py`, `_sampling.py`, `_attention.py`,
   `_moe.py`, `_collectives.py`, `_stream.py`, `_fp4.py`, `_decode.py`,
-  `_decode_fp4.py`, `_prefill.py`: 177 passed, 26 skipped (incl. the int8 dense
-  container round trips, the int8 / packed ring and the int8 MINI decode).
+  `_decode_fp4.py`, `_prefill.py`: 181 passed, 29 skipped, 9 warnings in 519 s at `b171b4d`
+  (`logs/final_cpu_suite.log`; incl. the int8 dense container round trips, the
+  int8 / packed ring and the int8 MINI decode).
 - TPU: the same files on hardware (single chip for the component tests, all
   eight cores for collectives / decode / prefill, plus the real-width smoke test
   of `_decode.py` that prints the VMEM budget and per-layer timings);
@@ -432,13 +433,15 @@ plus ~70 us of dispatch, XLA glue and the barrier.
 
 ## 12. Known open items
 
-- **NVFP4 at B > 1.** `fp4.expert_stream` is MXU-bound: the block-diagonal LHS
+- **NVFP4 at B >= 4.** `fp4.expert_stream` is MXU-bound: the block-diagonal LHS
   grows with `32 * B` rows (0.87 / 1.87 / 1.67 / 2.60 us per gate_up slice at B =
-  1 / 2 / 4 / 8) and the stream still carries four wave-body variants, giving
-  7.0 / 6.6 / 10.4 ms at B = 2 / 4 / 8 vs 3.7 / 3.9 / 4.3 ms for int4. Candidates
-  (`nvfp4_feasibility.md` section 3): split the experts between the MXU
+  1 / 2 / 4 / 8) and the B = 8 bf16-dequant dot pushes weights at half the fp8
+  rate, giving 4.25 / 4.46 ms at B = 4 / 8 with int8 dense vs 3.91 / 4.29 ms for
+  the bf16-dense int4 container (4.63 / 4.86 vs 3.91 / 4.29 when both are
+  bf16-dense; the first NVFP4 stream took 7.0 / 6.6 / 10.4 ms at B = 2 / 4 / 8).
+  Candidate (`nvfp4_feasibility.md` section 3): split the experts between the MXU
   block-diagonal path and a VPU dequant path (~17-20 us per layer at B = 8
-  projected), fewer wave-body variants.
+  projected).
 - **In-kernel embedding** (the XLA lookup + `psum` glue is ~20 us per step).
 - **Sliding-window ring buffer**: the caches are contiguous over the full
   context for every layer; the 46 sliding layers only ever read the last 2048
