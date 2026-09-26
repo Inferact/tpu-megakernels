@@ -60,6 +60,39 @@ def _cache_diff(a, b, layers):
     )
 
 
+def _bf16_ulp(x):
+    """One bf16 ulp at every element of `x` (f32 values, 8 mantissa bits incl. the hidden one)."""
+    exponent = np.floor(np.log2(np.maximum(np.abs(x), 2.0**-126))).astype(np.int32)
+    return np.ldexp(np.float32(1.0), exponent - 7)
+
+
+def _assert_layer0_cache(name, kind, got, ref):
+    """Layer-0 slots (post-norm, post-RoPE keys / raw values of the embedding) involve no
+    cross-rank summation, so the prefill must reproduce the reference bit for bit up to the f32
+    accumulation order INSIDE the bf16 projection GEMM: the prefill contracts the per-rank
+    `[H, 2 * kvh * D]` slice, the reference the full `[H, nKV * D]` matrix. XLA:CPU accumulates
+    both shapes in the same order (bit-exact, asserted); on TPU the f32 result of a bf16 GEMM
+    depends on its N-shape (~1e-7 relative), so a rare projection value (5 of 18944 measured)
+    is rounded to the neighbouring bf16: a 2^-8 relative step that the QK norm preserves, the
+    later roundings may widen by one more ulp, and RoPE carries to both halves of the
+    (d, d + D/2) pair. Checked there: every slot within two bf16 ulps at the magnitude of its
+    RoPE pair and >= 99.5 % bit-exact slots. A real layout / RoPE / mask bug moves most slots by
+    O(0.3).
+    """
+    got = np.asarray(got[0, 0, :T]).astype(np.float32)  # [T, kv heads, D]
+    ref = np.asarray(ref[0, 0, :T]).astype(np.float32)
+    half = ref.shape[-1] // 2
+    pair = np.maximum(np.abs(ref), np.abs(np.roll(ref, half, axis=-1)))  # |ref| over (d, d + D/2)
+    exact = float(np.mean(got == ref))
+    within_ulp = bool(np.all(np.abs(got - ref) <= 2 * _bf16_ulp(pair)))
+    print(
+        f"[{name}] {kind}-cache layer 0: exact slots {exact:.5f}, within two bf16 ulps {within_ulp}"
+    )
+    if jax.default_backend() == "cpu":
+        assert exact == 1.0, f"layer-0 {kind}-cache must be bit-exact on CPU ({exact:.5f} exact)"
+    assert within_ulp and exact >= 0.995
+
+
 @pytest.fixture(scope="module")
 def mesh():
     devices = jax.devices()
@@ -141,9 +174,9 @@ def test_prefill_writes_the_kernel_cache_layout(mesh, case):
     assert caches["k_cache"].shape == (TP, cfg.layers, 2, CONTEXT, lanes)
     mine = tuple(c[:, row : row + 1] for c in got)  # row `row` as a batch-1 canonical cache
     diffs = _cache_diff(mine, ref_caches, cfg.layers)
-    for kind, per_layer, cache in zip("kv", diffs, got):
+    for kind, per_layer, cache, ref in zip("kv", diffs, got, ref_caches):
         print(f"[{name}] {kind}-cache max |diff| per layer {np.round(per_layer, 3)}")
-        assert per_layer[0] == 0  # layer 0: bit-exact (post-norm, post-RoPE keys / raw values)
+        _assert_layer0_cache(name, kind, cache[:, row : row + 1], ref)
         assert np.all(per_layer <= CACHE_TOL)
         assert not np.any(cache[:, row, T:])  # pad slots and the untouched row stay zero
         assert not np.any(cache[:, 1 - row])

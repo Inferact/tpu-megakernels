@@ -5,9 +5,10 @@
 #   bash scripts/demo_musespark.sh [--prompt "..."] [--greedy] [--max-tokens N] [--serve 0.0.0.0:8000] [--bench]
 #
 # One process drives the eight devices of four TPU chips (TPU_VISIBLE_CHIPS=0,1,2,3). Weights
-# come from the pre-sharded int4 container (--weights, default /filestore/weights/muse-spark-tp8-int4)
-# and the tokenizer from the HF snapshot (--checkpoint). Then type prompts at "prompt>" (empty
-# line or 'quit' ends).
+# come from a pre-sharded container (--weights, default /filestore/weights/muse-spark-tp8-int4;
+# int4 g128 from scripts/convert_musespark.sh or NVFP4 from scripts/convert_musespark_nvfp4.sh,
+# the kernel infers the format) and the tokenizer from the HF snapshot (--checkpoint). Then
+# type prompts at "prompt>" (empty line or 'quit' ends).
 #
 # During development the chips are shared through the lock helper: run the launcher via
 #   TPU_RUN="<scratchpad>/tpu_run.sh all" bash scripts/demo_musespark.sh ...

@@ -8,8 +8,10 @@
 #   TPU_RUN="<scratchpad>/tpu_run.sh all" bash scripts/benchmark_musespark.sh   # shared chips
 #
 # CONTEXT (default 4096), STEPS (timed decode steps per batch size, default 256),
-# STEPS_PER_CALL (default 64), WEIGHTS, CHECKPOINT, OUTPUT_PATH may be overridden through the
-# environment; extra arguments are passed to the demo (e.g. --greedy).
+# STEPS_PER_CALL (default 64), WEIGHTS (int4 or NVFP4 container, default the int4 one),
+# CHECKPOINT, OUTPUT_PATH may be overridden through the environment; extra arguments are
+# passed to the demo (e.g. --greedy). The official numbers of README.md come from
+# scripts/validate_musespark_decode.py --tasks bench (16 steps per call).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
