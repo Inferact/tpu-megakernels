@@ -133,6 +133,11 @@ GLOBAL_KEYS = {
     "lm_head": "lm_head.weight",
     "final_norm": PREFIX + "norm.weight",
 }
+INT8_ENCODING = (
+    "int8 per output column: w[k, n] ~= q[k, n] * s[0, n] with s = absmax_k |w| / 127 (f32; "
+    "all-zero columns s = 1) and q = round-half-even(w / s) in [-127, 127]; o_s is the absmax "
+    "over the FULL o_proj contraction axis (all ranks hold the same o_s)"
+)
 EXPERT_NAMES = ("gate_up_q", "gate_up_s", "down_q", "down_s")
 FP4_EXPERT_NAMES = layout.FP4_EXPERT_FAMILIES
 GLOBAL_NAMES = ("embed", "lm_head", "final_norm")
@@ -410,10 +415,10 @@ def global_rank_arrays(cfg, tp, rank, embed_rows, lm_head_rows, final_norm):
 # ---------------------------------------------------------------------------------------
 
 
-def _shapes(cfg, tp, expert_format="int4"):
+def _shapes(cfg, tp, expert_format="int4", dense_format="bf16"):
     """`{name: (per-rank shape, np dtype)}` from `layout.rank_shapes`."""
     out = {}
-    for name, (shape, dtype) in layout.rank_shapes(cfg, tp, expert_format).items():
+    for name, (shape, dtype) in layout.rank_shapes(cfg, tp, expert_format, dense_format).items():
         out[name] = (tuple(int(s) for s in shape), np.dtype(dtype))
     return out
 
@@ -439,12 +444,17 @@ def _np_dtype(name):
     return {"bfloat16": BF16, "int4": INT4, "float8_e4m3fn": E4M3}.get(name, np.dtype(name))
 
 
-def make_layout(cfg, tp, revision=None, expert_format="int4", expert_source=None):
+def make_layout(cfg, tp, revision=None, expert_format="int4", expert_source=None,
+                dense_formats=("bf16",)):
     """The `layout.json` document of a container for `cfg`/`tp` (`expert_format` "int4" ->
     format v1, "nvfp4" -> format v2; `expert_source` documents, per layer, where the nvfp4
-    experts came from: "vendor" or "rtn" (quantized from bf16 by `quant.quantize_nvfp4_np`))."""
+    experts came from: "vendor" or "rtn" (quantized from bf16 by `quant.quantize_nvfp4_np`)).
+    `dense_formats` lists the dense-projection formats present: `("bf16",)` (the conversion
+    output) or `("bf16", "int8")` after `quantize_dense`, which appends the int8 pairs to
+    `arrays` and records `dense_format: int8` as the preferred format."""
     arrays = {}
-    for name, (shape, dtype) in _shapes(cfg, tp, expert_format).items():
+    dense = "both" if "int8" in dense_formats else "bf16"
+    for name, (shape, dtype) in _shapes(cfg, tp, expert_format, dense).items():
         dshape, ddtype = disk_spec(shape, dtype)
         arrays[name] = {
             "shape": list(shape),
@@ -473,6 +483,10 @@ def make_layout(cfg, tp, revision=None, expert_format="int4", expert_source=None
         doc["fp4_block"] = layout.FP4_BLOCK
         doc["expert_source"] = expert_source or {}
         doc["layer_kinds"] = ["nvfp4"] * cfg.layers
+    if "int8" in dense_formats:
+        doc["dense_formats"] = ["bf16", "int8"]
+        doc["dense_format"] = "int8"
+        doc["int8"] = INT8_ENCODING
     return doc
 
 
@@ -492,6 +506,33 @@ def layout_expert_format(doc):
 def container_expert_format(directory):
     """The expert format of the container at `directory` (`layout_expert_format`)."""
     return layout_expert_format(read_layout(directory))
+
+
+def layout_dense_formats(doc):
+    """The dense-projection formats a container holds: `("bf16",)` or `("bf16", "int8")`."""
+    return tuple(doc.get("dense_formats", ["bf16"]))
+
+
+def layout_dense_format(doc):
+    """The container's preferred dense format (`"int8"` once `quantize_dense` ran, else bf16)."""
+    return doc.get("dense_format", "bf16")
+
+
+def container_dense_format(directory):
+    return layout_dense_format(read_layout(directory))
+
+
+def weight_array_names(doc, dense_format=None):
+    """The arrays `load_presharded` loads for `dense_format` (default: the preferred one):
+    every array of the container except the dense projections of the other format."""
+    dense_format = dense_format or layout_dense_format(doc)
+    if dense_format not in layout_dense_formats(doc):
+        raise ValueError(
+            f"container holds dense formats {layout_dense_formats(doc)}, not {dense_format!r}"
+        )
+    other = "int8" if dense_format == "bf16" else "bf16"
+    skip = set(layout.dense_families(other))
+    return [name for name in doc["arrays"] if name not in skip]
 
 
 def config_from_layout(doc):
@@ -838,11 +879,12 @@ def _read_file(path, offset=0, nbytes=None, dtype=np.uint8, threads=READ_THREADS
     return out.view(dtype)
 
 
-def _load_rank(directory, doc, rank, device, layer_chunk_bytes, log):
-    """All arrays of one rank as single-device arrays on `device`."""
+def _load_rank(directory, doc, rank, device, layer_chunk_bytes, log, names=None):
+    """All arrays (or `names`) of one rank as single-device arrays on `device`."""
     placement = SingleDeviceSharding(device)
     arrays = {}
-    for name, spec in doc["arrays"].items():
+    for name in names if names is not None else doc["arrays"]:
+        spec = doc["arrays"][name]
         path = rank_file(directory, rank, name)
         shape, dtype = tuple(spec["shape"]), _np_dtype(spec["dtype"])
         dshape, ddtype = tuple(spec["disk_shape"]), np.dtype(spec["disk_dtype"])
@@ -893,19 +935,24 @@ def _load_rank(directory, doc, rank, device, layer_chunk_bytes, log):
 
 
 def load_presharded(mesh, directory, cfg=None, *, ranks_in_flight=8, layer_chunk_bytes=1 << 30,
-                    log=None):
+                    log=None, dense_format=None):
     """The container at `directory` as `{name: jax.Array[tp, ...]}` sharded `P("tp")` over
     `mesh` (rank r's arrays live on `mesh.devices.flat[r]`). int4 arrays are `jnp.int4`; a v2
     (nvfp4) container yields int32 packed codes, `float8_e4m3fn` block scales and f32 `expert_gs`
-    (`layout.FP4_EXPERT_FAMILIES`) instead of the int4 families."""
+    (`layout.FP4_EXPERT_FAMILIES`) instead of the int4 families. `dense_format` ("bf16" /
+    "int8", default: the container's preferred `dense_format`, int8 once `quantize_dense`
+    ran) selects which dense-projection arrays are loaded (`weight_array_names`): the bf16
+    families `q .. post`, `lm_head`, or their int8 `_i8` / `_s` pairs."""
     directory = Path(directory)
     doc = read_layout(directory)
     if not read_progress(directory).get("complete"):
         raise ValueError(f"{directory}: conversion is not complete (see progress.json)")
     tp = doc["tp"]
     fmt = layout_expert_format(doc)
-    if cfg is not None and make_layout(cfg, tp, expert_format=fmt)["arrays"] != doc["arrays"]:
+    expected = make_layout(cfg, tp, expert_format=fmt, dense_formats=layout_dense_formats(doc))
+    if cfg is not None and expected["arrays"] != doc["arrays"]:
         raise ValueError(f"{directory}: container layout does not match the requested config")
+    names = weight_array_names(doc, dense_format)
     devices = list(mesh.devices.flat)
     if len(devices) != tp:
         raise ValueError(f"mesh has {len(devices)} devices, container has tp={tp}")
@@ -913,29 +960,32 @@ def load_presharded(mesh, directory, cfg=None, *, ranks_in_flight=8, layer_chunk
     started = time.perf_counter()
     per_rank = {}
     with ThreadPoolExecutor(max(1, ranks_in_flight)) as pool:
-        futures = {r: pool.submit(_load_rank, directory, doc, r, devices[r], layer_chunk_bytes, log)
-                   for r in range(tp)}
+        futures = {r: pool.submit(_load_rank, directory, doc, r, devices[r], layer_chunk_bytes,
+                                  log, names) for r in range(tp)}
         for r, future in futures.items():
             per_rank[r] = future.result()
             log(f"rank {r} resident after {time.perf_counter() - started:.0f} s")
     sharding = NamedSharding(mesh, P("tp"))
     weights = {}
-    for name, spec in doc["arrays"].items():
+    for name in names:
+        spec = doc["arrays"][name]
         weights[name] = jax.make_array_from_single_device_arrays(
             (tp, *spec["shape"]), sharding, [per_rank[r][name] for r in range(tp)]
         )
-    log(f"{doc['total_bytes'] / 1e9:.0f} GB resident after {time.perf_counter() - started:.0f} s "
-        f"({doc['total_bytes'] / 1e9 / (time.perf_counter() - started):.2f} GB/s)")
+    total = tp * sum(doc["arrays"][name]["nbytes"] for name in names)
+    log(f"{total / 1e9:.0f} GB resident after {time.perf_counter() - started:.0f} s "
+        f"({total / 1e9 / (time.perf_counter() - started):.2f} GB/s)")
     return weights
 
 
-def abstract_weights(mesh, cfg, tp=None, expert_format="int4"):
+def abstract_weights(mesh, cfg, tp=None, expert_format="int4", dense_format="bf16"):
     """`jax.ShapeDtypeStruct` tree matching `load_presharded`, for AOT compilation
-    (`expert_format` of the container: `container_expert_format`)."""
+    (`expert_format` / `dense_format` of the container: `container_expert_format`,
+    `container_dense_format`)."""
     tp = tp or mesh.size
     sharding = NamedSharding(mesh, P("tp"))
     out = {}
-    for name, (shape, dtype) in _shapes(cfg, tp, expert_format).items():
+    for name, (shape, dtype) in _shapes(cfg, tp, expert_format, dense_format).items():
         jdtype = jnp.int4 if dtype == INT4 else jnp.dtype(dtype)
         out[name] = jax.ShapeDtypeStruct((tp, *shape), jdtype, sharding=sharding)
     return out
@@ -949,6 +999,144 @@ def zero_caches(mesh, cfg, batch, context):
     for name, (shape, dtype) in layout.kv_cache_shapes(cfg, batch, context, tp).items():
         out[name] = jax.jit(lambda: jnp.zeros((tp, *shape), dtype), out_shardings=sharding)()
     return out
+
+
+# ---------------------------------------------------------------------------------------
+# int8 dense projections written in place into an existing container (`quantize-dense`)
+# ---------------------------------------------------------------------------------------
+# One pool task per (layer, family): every rank's `[K, N_r]` bf16 layer slab is memmapped,
+# quantized with `quant.quantize_int8_np` (per output column) and written at the layer offset
+# of the preallocated `rank{r}/<family>_i8.bin` / `<family>_s.bin`. The row-sharded `o` is
+# quantized over the concatenated rows of all ranks (one shared `o_s`); the lm_head is one task
+# per rank. The bf16 families are never touched, so the container keeps serving both formats.
+
+_Q = SimpleNamespace(directory=None, doc=None, tp=None, fds={})
+
+
+def _q_init(directory, doc):
+    _Q.directory, _Q.doc, _Q.tp, _Q.fds = Path(directory), doc, doc["tp"], {}
+
+
+def _q_memmap(rank, name):
+    spec = _Q.doc["arrays"][name]
+    return np.memmap(rank_file(_Q.directory, rank, name), np.dtype(spec["disk_dtype"]), mode="r",
+                     shape=tuple(spec["disk_shape"]))
+
+
+def _q_write(rank, name, layer, value):
+    key = (rank, name)
+    if key not in _Q.fds:
+        _Q.fds[key] = os.open(rank_file(_Q.directory, rank, name), os.O_WRONLY)
+    data = _array_bytes(value)
+    _pwrite_all(_Q.fds[key], data, 0 if layer is None else layer * data.nbytes)
+
+
+def _quantize_dense_task(args):
+    index, family = args
+    tp = _Q.tp
+    if family == "lm_head":  # `index` is the rank
+        q, s = quant.quantize_int8_np(np.asarray(_q_memmap(index, "lm_head")))
+        _q_write(index, layout.int8_family(family), None, q)
+        _q_write(index, layout.scale_family(family), None, s)
+        return args
+    if family == "o":  # row-sharded: one scale per column over all ranks' rows
+        parts = [np.asarray(_q_memmap(r, "o")[index]) for r in range(tp)]
+        q, s = quant.quantize_int8_np(np.concatenate(parts, axis=0))
+        rows = parts[0].shape[0]
+        for r in range(tp):
+            _q_write(r, "o_i8", index, np.ascontiguousarray(q[r * rows:(r + 1) * rows]))
+            _q_write(r, "o_s", index, s)
+        return args
+    for r in range(tp):
+        q, s = quant.quantize_int8_np(np.asarray(_q_memmap(r, family)[index]))
+        _q_write(r, layout.int8_family(family), index, q)
+        _q_write(r, layout.scale_family(family), index, s)
+    return args
+
+
+def quantize_dense(directory, workers=None, layers=None, log=print, publish=True):
+    """Add the int8 dense families (`layout.dense_families("int8")`) to the complete container
+    at `directory`, in place: new `.bin` files next to the bf16 ones, `progress.json`
+    (`dense_int8`: resumable per layer) and, once every layer and the lm_head are done,
+    `layout.json` with the new `arrays` entries, `dense_formats: [bf16, int8]` and
+    `dense_format: int8` (the format `load_presharded` picks by default from then on).
+    `layers` restricts the run to some layers (the lm_head is always done). With
+    `publish=False` the files and the progress are written but `layout.json` is left alone
+    (readers keep getting the bf16 tree); a later call publishes a complete set. Returns the
+    progress document."""
+    directory = Path(directory)
+    doc = read_layout(directory)
+    progress = read_progress(directory)
+    if not progress.get("complete"):
+        raise ValueError(f"{directory}: conversion is not complete (see progress.json)")
+    cfg, tp = config_from_layout(doc), doc["tp"]
+    full = make_layout(cfg, tp, doc.get("revision"), layout_expert_format(doc),
+                       doc.get("expert_source"), dense_formats=("bf16", "int8"))
+    if {n: full["arrays"][n] for n in doc["arrays"]} != doc["arrays"]:
+        raise ValueError(f"{directory}: container layout does not match its config")
+    new_names = [n for n in full["arrays"] if n not in doc["arrays"]]
+    state = progress.get("dense_int8") or {"layers": [], "lm_head": False, "complete": False}
+    if state["complete"] and layers is None:
+        log(f"{directory}: int8 dense families already complete")
+        if publish and layout_dense_format(doc) != "int8":
+            _publish_int8(directory, doc, full, log)
+        return progress
+    for r in range(tp):
+        for name in new_names:
+            path, size = rank_file(directory, r, name), full["arrays"][name]["nbytes"]
+            if not path.exists() or path.stat().st_size != size:
+                with open(path, "wb") as f:
+                    f.truncate(size)
+    wanted = list(range(cfg.layers)) if layers is None else sorted(set(int(l) for l in layers))
+    todo = [l for l in wanted if l not in state["layers"]]
+    tasks = [(l, f) for l in todo for f in layout.INT8_DENSE]
+    if not state["lm_head"]:
+        tasks += [(r, "lm_head") for r in range(tp)]
+    workers = workers or max(1, min(32, os.cpu_count() or 1, len(tasks)))
+    log(f"{directory}: quantizing {len(todo)} layers x {len(layout.INT8_DENSE)} families"
+        f"{'' if state['lm_head'] else ' + lm_head'} with {workers} workers ({len(tasks)} tasks)")
+
+    def save():
+        progress["dense_int8"] = state
+        _write_json(directory / "progress.json", progress)
+
+    started = time.perf_counter()
+    done = {l: 0 for l in todo}
+    lm_done = 0
+    if tasks:
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Pool(workers, initializer=_q_init, initargs=(directory, doc)) as pool:
+            for i, (index, family) in enumerate(pool.imap_unordered(_quantize_dense_task, tasks)):
+                if family == "lm_head":
+                    lm_done += 1
+                    if lm_done == tp:
+                        state["lm_head"] = True
+                        save()
+                else:
+                    done[index] += 1
+                    if done[index] == len(layout.INT8_DENSE):
+                        state["layers"] = sorted(set(state["layers"]) | {index})
+                        save()
+                if (i + 1) % 32 == 0 or i + 1 == len(tasks):
+                    log(f"  {i + 1}/{len(tasks)} tasks after {time.perf_counter() - started:.0f} s")
+    state["complete"] = bool(state["lm_head"]) and len(state["layers"]) == cfg.layers
+    save()
+    if state["complete"]:
+        log(f"{directory}: int8 dense families complete in {time.perf_counter() - started:.0f} s")
+        if publish:
+            _publish_int8(directory, doc, full, log)
+    return progress
+
+
+def _publish_int8(directory, doc, full, log):
+    """Rewrite `layout.json` with the int8 arrays and `dense_format: int8`."""
+    doc = dict(doc)
+    doc["arrays"] = full["arrays"]
+    doc["total_bytes"] = full["total_bytes"]
+    doc["dense_formats"], doc["dense_format"], doc["int8"] = (
+        full["dense_formats"], full["dense_format"], full["int8"])
+    _write_json(Path(directory) / "layout.json", doc)
+    log(f"{directory}: layout.json now prefers dense_format int8")
 
 
 # ---------------------------------------------------------------------------------------
@@ -1801,6 +1989,13 @@ def _cli(argv=None):
     nv.add_argument("--max-shards", type=int, default=3, help="shards kept on disk at once")
     nv.add_argument("--shards", type=int, default=None, help="only the first n shards (tests)")
     nv.add_argument("--min-free-gb", type=float, default=8.0)
+    qd = sub.add_parser("quantize-dense",
+                        help="add int8 per-output-channel dense projections to a container")
+    qd.add_argument("--dir", required=True)
+    qd.add_argument("--workers", type=int, default=None)
+    qd.add_argument("--layers", type=str, default=None, help="e.g. '0' or '0,1,5'")
+    qd.add_argument("--no-publish", action="store_true",
+                    help="write the files but leave layout.json on bf16 (publish with a later run)")
     ver = sub.add_parser("verify", help="spot-check a converted layer against the checkpoint")
     ver.add_argument("--src", required=True)
     ver.add_argument("--dst", required=True)
@@ -1822,6 +2017,11 @@ def _cli(argv=None):
             args.src, args.dst, tp=args.tp, workers=args.workers, max_shards=args.max_shards,
             shards=args.shards, min_free_bytes=int(args.min_free_gb * 2**30), log=log)
         return 0 if progress["complete"] else 1
+    if args.command == "quantize-dense":
+        layers = None if args.layers is None else [int(x) for x in args.layers.split(",")]
+        progress = quantize_dense(args.dir, workers=args.workers, layers=layers, log=log,
+                                  publish=not args.no_publish)
+        return 0 if progress["dense_int8"]["complete"] else 1
     results = verify_layer(args.src, args.dst, args.layer,
                            [int(x) for x in args.experts.split(",")], log)
     print(json.dumps(results, indent=1))
