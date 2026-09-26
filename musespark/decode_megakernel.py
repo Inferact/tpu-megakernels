@@ -61,6 +61,9 @@ Payload rows of the collectives are padded to 8 (`stream.mxu_rows`); payloads na
     "banks=N"          dense ring depth in 2 MiB loads (default: `default_geometry`, 12 unless a
                        shallower ring (>= 8; the depth is not measurable above 8) is needed to
                        fit 8 expert slots)
+    "ring=blockdiag|plain"
+                       one block-diagonal MXU op per packed bank load (default) or one dot per
+                       K-tile (`stream.make_ring(blockdiag=)`)
     "wire=bf16|f32"    payload dtype of the two per-layer all-reduces (default bf16: every
                        rank's partial is rounded to bf16 before the fixed-order f32 summation
                        and the reduced blocks travel as bf16 -- the result is r16'd by the
@@ -161,7 +164,7 @@ def parse_options(options):
     """`frozenset` of option strings -> namespace (see the module docstring)."""
     opts = SimpleNamespace(
         interpret=False, aux_hidden=False, moe_slots=None, skip=frozenset(), wire=BF16,
-        kv_late=False, defer=None, banks=None, flush="last", hier=None,
+        kv_late=False, defer=None, banks=None, flush="last", hier=None, ring="blockdiag",
     )
     for opt in options:
         if opt == "interpret":
@@ -184,6 +187,10 @@ def parse_options(options):
             opts.hier = {"on": True, "off": False}[opt.split("=", 1)[1]]
         elif opt.startswith("banks="):
             opts.banks = int(opt.split("=", 1)[1])
+        elif opt.startswith("ring="):
+            opts.ring = opt.split("=", 1)[1]
+            if opts.ring not in ("plain", "blockdiag"):
+                raise ValueError(f"unknown ring mode {opts.ring!r}")
         elif opt.startswith("wire="):
             opts.wire = {"bf16": BF16, "f32": F32}[opt.split("=", 1)[1]]
         elif opt.startswith("skip="):
@@ -461,7 +468,7 @@ def _kernel_body(cfg: Config, batch, tp, opts):
         lm_head = None if "lm_head" in skip else weights[lm_name]
         ring = stream.make_ring(
             cfg, scratch["ring"], weights, lm_head, tp=tp, dense_format=dfmt,
-            bitcast=not opts.interpret,
+            bitcast=not opts.interpret, blockdiag=opts.ring == "blockdiag",
         )
         ws = collectives.workspace(
             *scratch["collectives"], f32_wire=opts.wire == F32, hierarchical=opts.hier

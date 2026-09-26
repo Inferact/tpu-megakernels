@@ -163,6 +163,7 @@ class Harness:
         key = (batch, return_logits, aux)
         if key not in self.decoders:
             options = frozenset({"aux_hidden"} if aux else set())
+            options |= frozenset(x for x in (getattr(self.args, "decode_options", "") or "").split(",") if x)
             self.log(f"building decode program B={batch} logits={return_logits} aux={aux}")
             self.decoders[key] = dk.make_decode(
                 self.mesh, self.cfg, self.context, batch, greedy=True,
@@ -560,6 +561,8 @@ def main(argv=None):
     parser.add_argument("--context", type=int, default=4096)
     parser.add_argument("--dense-format", default=None, choices=list(layout.DENSE_FORMATS),
                         help="bf16 or int8 dense projections (default: the container's preferred)")
+    parser.add_argument("--decode-options", default="",
+                        help="comma-separated `make_decode` options (e.g. ring=plain,banks=10)")
     parser.add_argument("--tasks", default="replay,generate,bench")
     parser.add_argument("--replay-prompts", default="0,3")
     parser.add_argument(

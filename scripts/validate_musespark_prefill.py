@@ -138,6 +138,8 @@ def main(argv=None):
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--out", default=DEFAULT_OUT)
     parser.add_argument("--context", type=int, default=4096)
+    parser.add_argument("--dense-format", default=None, choices=["bf16", "int8"],
+                        help="dense projections to load (default: the container's preferred)")
     parser.add_argument("--max-tokens", type=int, default=48)
     parser.add_argument("--prompts", type=int, default=None, help="only the first N prompts")
     parser.add_argument("--no-taps", action="store_true", help="skip the residual-stream taps")
@@ -162,8 +164,9 @@ def main(argv=None):
     if len(devices) < TP:
         raise RuntimeError(f"need {TP} TPU devices, found {len(devices)}")
     mesh = jax.sharding.Mesh(np.asarray(devices[:TP]), ("tp",))
-    doc = ms_load.read_layout(args.weights)
+    doc = ms_load.effective_layout(args.weights)
     cfg = ms_load.config_from_layout(doc)
+    dense_format = args.dense_format or ms_load.layout_dense_format(doc)
     # check (b): the container config equals the checkpoint config
     ckpt_cfg = Config.from_checkpoint(args.checkpoint)
     log(f"config from layout == Config.from_checkpoint: {cfg == ckpt_cfg}")
@@ -187,15 +190,17 @@ def main(argv=None):
         prompts.append((name, kind, text, ids, rendered))
     log(f"rendered prompt 0:\n{prompts[0][4]}")
 
-    log(f"loading weights from {args.weights} ({doc['total_bytes'] / 1e9:.0f} GB)")
+    log(f"loading weights from {args.weights} ({doc['total_bytes'] / 1e9:.0f} GB, "
+        f"{dense_format} dense)")
     t0 = time.perf_counter()
-    weights = ms_load.load_presharded(mesh, args.weights, cfg, log=log)
+    weights = ms_load.load_presharded(mesh, args.weights, cfg, log=log, dense_format=dense_format)
     load_seconds = time.perf_counter() - t0
     log(f"weights resident in {load_seconds:.0f} s")
 
     runner = Runner(mesh, cfg, weights, args.context, log)
     summary = {
         "weights": args.weights,
+        "dense_format": dense_format,
         "checkpoint": args.checkpoint,
         "revision": doc.get("revision"),
         "context": args.context,

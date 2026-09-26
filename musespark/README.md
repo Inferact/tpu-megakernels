@@ -80,6 +80,9 @@ a leading `tp` axis sharded `P("tp")`. With `qh = 16`, `kvh = 2`, `D = 64`,
 | `pre` | `[62, 8192, 512]` | bf16 | output-sharded |
 | `router_hi`, `router_lo` | `[62, 8192, 256]` | bf16 | `hi = bf16(W)`, `lo = bf16(W - hi)`, `logits = dot(x, hi) + dot(x, lo)` in f32 |
 | `post` | `[62, 4096, 1024]` | bf16 | output-sharded |
+| int8 dense (`dense_format` int8) `q_i8`, `kv_i8`, `gate_i8`, `o_i8`, `pre_i8`, `post_i8` | the bf16 shapes | int8 | per-output-column `w ~= q * s`, `s = absmax_K / 127` (`quant.quantize_int8`); `o_s` over the full o_proj K (identical on every rank) |
+| `q_s`, `kv_s`, `gate_s`, `o_s`, `pre_s`, `post_s` | `[62, 1, N]` | f32 | prefetched per layer like the norm vectors |
+| `lm_head_i8`, `lm_head_s` | `[8192, 25600]`, `[1, 25600]` | int8, f32 | padded columns: `q = 0`, `s = 1` |
 | int4 (format v1) `gate_up_q` | `[62, 256, 4096, 1024]` | int4 | cols 0:512 gate, 512:1024 up |
 | `gate_up_s` | `[62, 256, 8, 4, 1024]` | f32 | group-128 scales, `[K/KC, KC/G, N]` chunked |
 | `down_q` | `[62, 256, 512, 4096]` | int4 | |
@@ -90,10 +93,12 @@ a leading `tp` axis sharded `P("tp")`. With `qh = 16`, `kvh = 2`, `D = 64`,
 | `down_bs` | `[62, 256, 1, 32, 4096]` | float8_e4m3fn | |
 | `expert_gs` | `[62, 256, 8, 128]` | f32 | row 0 gate, row 1 up, row 2 down global scale, replicated over lanes |
 
-Bytes per rank (`layout.rank_shapes`): dense 4.60 GiB (76 MiB per layer), int4
-experts 49.4 GiB (3.19 MiB per expert), NVFP4 experts 52.4 GiB (3.38 MiB per
-expert), embedding + `lm_head` 0.78 GiB; totals 54.8 GiB (int4) and 57.8 GiB
-(NVFP4) of the 94.7 GB HBM. The KV cache costs 31 KiB per token per rank.
+Bytes per rank (`layout.rank_shapes`): dense 4.60 GiB (76 MiB per layer) in bf16
+or 2.55 GiB (42 MiB per layer: 34 MiB of int8 + the 8 MiB bf16 router pair) in
+int8, int4 experts 49.4 GiB (3.19 MiB per expert), NVFP4 experts 52.4 GiB (3.38
+MiB per expert), embedding + `lm_head` 0.78 GiB (0.59 GiB with the int8
+`lm_head`); totals 54.8 GiB (int4) and 57.8 GiB (NVFP4) of the 94.7 GB HBM with
+bf16 dense. The KV cache costs 31 KiB per token per rank.
 
 KV cache (`load.zero_caches`): `k_cache` and `v_cache` `[62, B, context, 128]`
 bf16 per rank, lanes `[h * 64, (h + 1) * 64)` = local KV head `h`; K is
@@ -129,6 +134,22 @@ family, the per-rank shape/dtype and the on-disk shape/dtype/byte count.
   block scales clamped to `[2^-9, 448]`, RNE) so the kernel has one expert format
   and no per-layer predicate. Shards are downloaded one at a time, converted and
   deleted. 496 GB on disk.
+
+- **int8 dense projections (`dense_format` int8)**, added IN PLACE to a complete
+  v1 or v2 container by `python -m musespark.load quantize-dense --dir <dir>`
+  (`load.quantize_dense`, ~25 s for the real container on a 32-process pool:
+  every rank's bf16 layer slab is memmapped and quantized per output column,
+  `o` over the concatenated rows of all ranks, the lm_head per rank). It writes
+  the `_i8` / `_s` files next to the untouched bf16 families (+19 GB), records
+  the progress under `progress.json["dense_int8"]` (resumable) and, when
+  complete, appends the new entries to `layout.json` with `dense_formats:
+  [bf16, int8]` and `dense_format: int8` (the preferred format;
+  `--no-publish` leaves `layout.json` on bf16 until a later run publishes).
+  `load_presharded(..., dense_format=None | "bf16" | "int8")` loads one set of
+  dense arrays (`weight_array_names`), default the preferred one;
+  `layout.dense_format_of(weights)` lets the kernel, the prefill and the
+  reference dispatch on the family names. Quantization error: 1.0-1.3 % relative
+  RMS per matrix (bf16 rounding alone is 0.2 %).
 
 `load_presharded` places each rank's arrays on its own device
 (`jax.device_put` + `make_array_from_single_device_arrays`) and unpacks the int4
@@ -171,15 +192,28 @@ t = r16(ffn_out * post_ffn_norm[l]); s = alpha * s + beta * r16(t * rsqrt(mean(t
 x_attn = r16(rms(s, attn_norm[l + 1]))
 ```
 
-- **Dense ring** (`stream.py`): 12 banks of `[1024, 1024]` bf16 (2 MiB); the
-  static schedule (`layout.tile_schedule`) streams q, kv, gate, o, pre,
-  router_hi, router_lo, post of every layer and then the `lm_head`; narrow
-  families are packed side by side so every load is a full 2 MiB (38 loads per
-  layer). `gemv` re-issues load `g + 12` right after consuming `g`, so 24 MiB stay
-  in flight across layer boundaries. Refills issued during the pre/router gemvs
-  are held back until the first expert slabs are queued (`defer=next`, default
-  at B <= 4), because the DMA engine shares bandwidth among outstanding
-  descriptors.
+- **Dense ring** (`stream.py`): 12 banks of `[1024, 1024]` bf16 (2 MiB), or
+  `[1024, 2048]` int8 (the same 2 MiB) for an int8 container; the static
+  schedule (`layout.tile_schedule`) streams q, kv, gate, o, pre, router_hi,
+  router_lo, post of every layer and then the `lm_head`; narrow families are
+  packed side by side so every load is a full 2 MiB (38 loads per layer in bf16,
+  21 in int8). `gemv` re-issues load `g + 12` right after consuming `g`, so 24 MiB
+  stay in flight across layer boundaries. Refills issued during the pre/router
+  gemvs are held back until the first expert slabs are queued (`defer=next`,
+  default at B <= 4), because the DMA engine shares bandwidth among outstanding
+  descriptors. Every packed load is consumed by ONE MXU op: the `pack` K-slices
+  of x are stacked as row blocks (`[pack * 8, 1024]`, built once per gemv) and
+  multiplied by the whole bank; the wanted partial products are the diagonal
+  `[8, bn]` blocks of the result (the MXU is weight-push bound, the off-diagonal
+  rows are free). In int8 the tiles feed `jnp.dot(bf16, int8)` directly (pushed at
+  the bf16 rate, 20 ns per 256 x 256 tile, never `.astype`) and the f32 column
+  sums of each N-block are multiplied by the per-column scales after the K sweep
+  (`gemv(..., scale=)`); the bf16 router tiles live in the int8 bank through its
+  `.bitcast(bf16)` view (`[512, 2048]`). Measured on chip (16 real-width layers,
+  `tests/test_musespark_stream.py`): bf16 26.4 us per layer (3.0 TB/s, DMA-bound),
+  int8 17.5 us (DMA-only floor 16.1; one narrow dot per K-tile gave 21.1 --
+  the issue latency and int8 conversion of 72 small dots per layer), `lm_head`
+  130 -> 68 us.
 - **Attention** (`attention.py`): 256-token KV tiles, three buffers per cache
   (two in flight, one consumed), block range `[lo // 256, pos // 256]` with `lo =
   max(0, pos - 2047)` on sliding layers and 0 on full layers; a block-diagonal
@@ -342,6 +376,21 @@ context 4096, every row prompt 0 of 151 tokens, 128 timed steps of 16 per call):
 | 4 | 3.912 | 1022 | 3.75 ms | 6.598 | 606 |
 | 8 | 4.291 | 1864 | 5.82 ms | 10.398 | 769 |
 
+With the int8 dense projections + `lm_head` (`dense_format` int8, the
+container's default since `quantize-dense` ran; `perf_log.md` E15), same
+benchmark, NVFP4 experts:
+
+| B | bf16 dense ms/step (`logs/..._20260926T070309Z.log`) | int8 dense ms/step (`scratchpad/i8/val_int8_run1.log`) | tok/s per row | tok/s aggr. |
+|---|---:|---:|---:|---:|
+| 1 | 3.565 | **3.280** | **304.8** | 305 |
+| 2 | 4.070 | 3.666 | 272.8 | 546 |
+| 4 | 4.626 | 4.257 | 234.9 | 940 |
+| 8 | 4.861 | 4.469 | 223.8 | 1790 |
+
+(int8 halves the dense bytes: 42 MiB per layer instead of 76, `lm_head` 200 MiB
+instead of 400; the layer's dense phase is then MXU-bound at the bf16 push rate,
+17.5 us per layer in the stream benchmark vs 26.4 us for bf16.)
+
 The first kernel version (`logs/validate_musespark_decode_20260926T022450Z.log`)
 took 4.531 / 4.712 / 5.096 / 6.012 ms; the gains came from the bf16 wire, KV
 prefetch, deferred ring refills, packed 2 MiB bank loads, packed int4 slots,
@@ -364,12 +413,18 @@ plus ~70 us of dispatch, XLA glue and the barrier.
   rope equivalence, routing ties), `_quant.py`, `_layout.py`, `_load.py`
   (container round trips), `_tokenizer.py`, `_sampling.py`, `_attention.py`,
   `_moe.py`, `_collectives.py`, `_stream.py`, `_fp4.py`, `_decode.py`,
-  `_decode_fp4.py`, `_prefill.py`: 147 passed, 22 skipped.
+  `_decode_fp4.py`, `_prefill.py`: 177 passed, 26 skipped (incl. the int8 dense
+  container round trips, the int8 / packed ring and the int8 MINI decode).
 - TPU: the same files on hardware (single chip for the component tests, all
   eight cores for collectives / decode / prefill, plus the real-width smoke test
   of `_decode.py` that prints the VMEM budget and per-layer timings);
   `tests/test_musespark_real_prefill.py` and `_real_decode.py` on the real
-  container against the oracle of `scripts/validate_musespark_prefill.py`.
+  container against the oracle of `scripts/validate_musespark_prefill.py`
+  (`--dense-format` selects the oracle's dense projections;
+  `MUSESPARK_DENSE_FORMAT` the test's). On the NVFP4 container the prompt-0
+  replay sits on a routing near-tie: kernel vs XLA prefill is 1.6 (bf16, before
+  the int8 work) to 9.8 (int8) in max |logit diff| there, 0.7-1.1 on prompts 1/2,
+  with the same argmax and teacher-forced hit rate (`perf_log.md` E15).
 - `scripts/validate_musespark_decode.py` (replay / generate / bench on real
   weights), `scripts/compare_official_musespark.py` (JAX reference vs the
   official sglang layer maths, CPU, real bf16 weights), `scripts/eval_musespark_gsm8k.sh`
@@ -384,8 +439,6 @@ plus ~70 us of dispatch, XLA glue and the barrier.
   (`nvfp4_feasibility.md` section 3): split the experts between the MXU
   block-diagonal path and a VPU dequant path (~17-20 us per layer at B = 8
   projected), fewer wave-body variants.
-- **int8 `lm_head`** (400 MiB bf16 = 126 us of the ~195 us fixed cost per step;
-  int8 would save ~60 us).
 - **In-kernel embedding** (the XLA lookup + `psum` glue is ~20 us per step).
 - **Sliding-window ring buffer**: the caches are contiguous over the full
   context for every layer; the 46 sliding layers only ever read the last 2048

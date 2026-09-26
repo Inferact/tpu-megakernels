@@ -16,7 +16,10 @@ weights (25 s from the page cache), so run it alone through the TPU launcher:
     XLA_FLAGS=--xla_allow_excess_precision=false tpu_run.sh all \
         python -m pytest tests/test_musespark_real_decode.py -s
 
-`MUSESPARK_REAL_REF` / `MUSESPARK_WEIGHTS` / `MUSESPARK_CHECKPOINT` override the locations.
+`MUSESPARK_REAL_REF` / `MUSESPARK_WEIGHTS` / `MUSESPARK_CHECKPOINT` override the locations;
+`MUSESPARK_DENSE_FORMAT` (bf16 / int8) selects the dense projections (default: the container's
+preferred format) -- the oracle must have been produced with the same dense format
+(`validate_musespark_prefill.py --dense-format`).
 """
 
 import importlib.util
@@ -85,6 +88,7 @@ def harness():
     args = argparse.Namespace(
         weights=str(WEIGHTS), checkpoint=str(CHECKPOINT), ref=str(REF), context=4096,
         steps_per_call=16, bench_steps=0,
+        dense_format=os.environ.get("MUSESPARK_DENSE_FORMAT") or None,
     )
     log = lambda m: print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
     return M.Harness(args, log)
