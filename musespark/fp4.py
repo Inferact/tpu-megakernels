@@ -29,6 +29,13 @@ scalar multiplies on the `[B, N]` results, `apply_gate_up_gs` / `apply_down_gs`)
   load: `bitcast(sd[pl.ds(j, 8, stride=0)], bf16)` is the `[16, N]` scale block.
 
 `DEQUANT_MIN_BATCH` selects the formulation statically from the batch (measured crossover).
+Experts with <= `COMPACT_ROWS` active rows (B > COMPACT_ROWS, genuinely different rows) run
+the block-diagonal dots on a compact LHS of just those rows (64 MXU rows: 1.1 + 0.7 us).
+
+Measured (official bench, 8 identical rows, ms/step at B = 1 / 2 / 4 / 8): 3.57 / 4.07 / 4.63 /
+4.86 (int4 g128: 3.59 / 3.71 / 3.91 / 4.29); before the stream rewrite 3.82 / 6.98 / 6.60 /
+10.40. B >= 4 sit at the MXU floor of the exact formulations (bf16 weight push is 2x the fp8
+rate; the block-diagonal LHS streams 32*B rows), ~9 us per layer above the DMA-bound int4 phase.
 
 Expert stream (`expert_stream`, same bookkeeping tiles / `moe.route_to_scratch` /
 `moe.finalize` as the int4 path): B = 1 is the static route-slot stream of `moe` (waves of
