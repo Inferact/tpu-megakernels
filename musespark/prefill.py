@@ -19,9 +19,9 @@ after every layer) and are only there so one executable serves every prompt of t
 
 Numerics mirror the decode kernel (design.md section 4), i.e. the spec's rounding points:
 f32 residual stream, `r16` (bf16 round trip) at every norm output and branch output, bf16 x bf16
-GEMMs with f32 accumulation, the f32 router as `dot(x, hi) + dot(x, lo)`, int4 experts
-dequantized on the fly (one layer at a time inside the layer loop, `quant.dequantize_int4`)
-and rounded to bf16, `gate_up` outputs kept in f32 until the SwiGLU rounding, the per-expert
+GEMMs with f32 accumulation, the f32 router as `dot(x, hi) + dot(x, lo)`, quantized experts
+(int4 g128 or NVFP4 families, `dequantized_experts`) dequantized on the fly one layer at a
+time inside the layer loop and rounded to bf16, `gate_up` outputs kept in f32 until the SwiGLU rounding, the per-expert
 `post_expert_norm` applied to the cross-rank sum of the partial `down` outputs. Attention scores
 are bf16 q/k products accumulated in f32 and the probabilities stay f32 (`HIGHEST`, the kernel's
 hi/lo MXU mode). Experts are evaluated with `jax.lax.ragged_dot` after sorting the `Tp * top_k`
@@ -107,12 +107,34 @@ def _attention(cfg, q, k, v, positions, real, window, tp):
     return o.reshape(T, qh, D)
 
 
+def dequantized_experts(w, l, isl):
+    """This rank's experts of layer `l` as bf16 `(gate_up [E, Hm, 2*Is], down [E, Is, Hm])`
+    from either expert format: int4 g128 (`quant.dequantize_int4`, container v1) or NVFP4
+    (`quant.dequant_fp4_jnp`: `e2m1 * e4m3` exact, times the per-expert global scales of
+    `expert_gs` -- row 0 for the gate columns, row 1 for the up columns, row 2 for down)."""
+    if "gate_up_fp4" in w:
+        gs = w["expert_gs"][l]  # [E, 8, 128]
+        col = _iota_cols(2 * isl) < isl  # [1, 2*Is]
+        gu_gs = jnp.where(col, gs[:, 0:1, 0:1], gs[:, 1:2, 0:1])  # [E, 1, 2*Is]
+        gate_up = quant.dequant_fp4_jnp(w["gate_up_fp4"][l], w["gate_up_bs"][l], gu_gs)
+        down = quant.dequant_fp4_jnp(w["down_fp4"][l], w["down_bs"][l], gs[:, 2:3, 0:1])
+        return gate_up.astype(BF16), down.astype(BF16)
+    gate_up = quant.dequantize_int4(w["gate_up_q"][l], w["gate_up_s"][l]).astype(BF16)
+    down = quant.dequantize_int4(w["down_q"][l], w["down_s"][l]).astype(BF16)
+    return gate_up, down
+
+
+def _iota_cols(n):
+    return jnp.arange(n, dtype=jnp.int32)[None, :]
+
+
 def _experts(cfg, w, l, h1, idx, weights, rank, tp):
     """Routed experts of one layer on `h1 [Tp, Hm]` (bf16 values) -> `m [Tp, Hm/tp]` f32.
 
     `idx [Tp, K]` / `weights [Tp, K]` are the routes; the `Tp * K` (token, slot) rows are sorted
-    by expert so `lax.ragged_dot` sees contiguous groups. The int4 experts of this layer are
-    dequantized here (bf16, `[E, Hm, 2*Is]` and `[E, Is, Hm]`); the `down` outputs are partial
+    by expert so `lax.ragged_dot` sees contiguous groups. The quantized experts of this layer
+    are dequantized here (`dequantized_experts`: bf16 `[E, Hm, 2*Is]` and `[E, Is, Hm]`, int4
+    or NVFP4 families); the `down` outputs are partial
     sums over this rank's `Is` slice and are reduce-scattered over `Hm`; the post-expert norm
     (weight before the norm, no weight after) is applied per (token, slot) on the full sum
     and the top-k mixture is formed on this rank's `Hm / tp` slice.
@@ -124,10 +146,9 @@ def _experts(cfg, w, l, h1, idx, weights, rank, tp):
     order = jnp.argsort(eid, stable=True)
     group_sizes = jnp.zeros((E,), jnp.int32).at[eid].add(1)
     lhs = jnp.take(h1.astype(BF16), order // K, axis=0)  # [R, Hm]
-    gate_up = quant.dequantize_int4(w["gate_up_q"][l], w["gate_up_s"][l]).astype(BF16)
+    gate_up, down = dequantized_experts(w, l, isl)
     gu = lax.ragged_dot(lhs, gate_up, group_sizes, preferred_element_type=F32)  # [R, 2*Is]
     act = r16(jax.nn.silu(gu[:, :isl]) * gu[:, isl:]).astype(BF16)
-    down = quant.dequantize_int4(w["down_q"][l], w["down_s"][l]).astype(BF16)
     y = lax.ragged_dot(act, down, group_sizes, preferred_element_type=F32)  # [R, Hm] partial
     y = lax.psum_scatter(y, "tp", scatter_dimension=1, tiled=True)  # [R, Hm/tp] full sum
     w_post = lax.dynamic_slice_in_dim(w["post_expert_norm"][l], rank * hm_r, hm_r, axis=1)

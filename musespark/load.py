@@ -27,6 +27,19 @@ Three stages, each usable on its own:
 3. `load_presharded` places every rank's arrays on its own device (`jax.device_put` +
    `jax.make_array_from_single_device_arrays`, the Kimi idiom) and unpacks the int4 nibbles
    on the device, so host RAM only ever sees one layer of packed bytes per rank.
+
+Container format v2 (`FORMAT_V2`, `expert_format == "nvfp4"`, `convert_presharded_nvfp4`): the
+same dense/vector/global families, but the experts are the vendor's NVFP4 tensors re-laid out
+per rank without any float maths (`quant.nvfp4_rows_to_packed`): `gate_up_fp4 [L, E, Hm/8, 2*Is]`
+int32 (eight e2m1 codes per word along K), `gate_up_bs [L, E, Hm/KC, KC/16, 2*Is]` e4m3 block
+scales (stored as their uint8 bits), `down_fp4 [L, E, Is/8, Hm]`, `down_bs [L, E, Is/KC, KC/16,
+Hm]` and `expert_gs [L, E, 8, 128]` f32 (row 0 gate, row 1 up, row 2 down global scale,
+replicated over the lanes). Layers whose experts the vendor left in bf16 (0 and 61) are quantized
+to the SAME format by `quant.quantize_nvfp4_np` (per-half global amax, modelopt rounding) so the
+kernel has one expert format. The source checkpoint (533 GB) is streamed shard by shard from
+the Hub (`ShardSource`): a shard is downloaded, every text-model tensor it holds is converted
+into the container, and the shard is deleted, keeping at most a few shards on disk; progress is
+per conversion unit (`progress.json`) and resumable.
 """
 
 from __future__ import annotations
@@ -66,12 +79,22 @@ from . import (
 
 BF16 = np.dtype(ml_dtypes.bfloat16)
 INT4 = np.dtype(ml_dtypes.int4)
+E4M3 = np.dtype(ml_dtypes.float8_e4m3fn)
 PREFIX = "model.language_model."
 FORMAT = "musespark-presharded-v1"
+FORMAT_V2 = "musespark-presharded-v2"
+FORMATS = (FORMAT, FORMAT_V2)
 INT4_ENCODING = (
     "uint8, two int4 values per byte along the last axis, low nibble = even index; "
     "value = ((byte >> (4 * (i % 2))) & 0xF) sign-extended from 4 bits"
 )
+FP4_ENCODING = (
+    "int32 [K/8, N]: e2m1 code of row 8k'+j in bits 4j..4j+3 (low nibble first; "
+    "pltpu.bitcast(int32 -> float4_e2m1fn) order); block scales float8_e4m3fn stored as "
+    "uint8 bits, one per 16 rows, K-chunk major [K/KC, KC/16, N]; expert_gs [8, 128] f32 rows "
+    "0/1/2 = gate/up/down per-expert global scale; w = e2m1 * e4m3 * gs"
+)
+NVFP4_REPO = "meta-models/Muse-Spark-1.2-816B-A42B-NVFP4-open"
 
 # Names of the per-layer checkpoint tensors (suffixes of `PREFIX + f"layers.{l}."`).
 LAYER_SUFFIXES = (
@@ -95,12 +118,23 @@ LAYER_SUFFIXES = (
     "mlp.post_expert_proj.weight",
 )
 EXPERT_SUFFIXES = ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+DENSE_SUFFIXES = tuple(s for s in LAYER_SUFFIXES if s not in EXPERT_SUFFIXES)
+# NVFP4 checkpoint expert tensors (`*_input_scale` exist too and are ignored: bf16 activations).
+NVFP4_SUFFIXES = {
+    "gate_up_fp4": "mlp.experts.gate_up_proj",
+    "gate_up_bs": "mlp.experts.gate_up_proj_weight_scale",
+    "gate_up_gs": "mlp.experts.gate_up_proj_weight_scale_2",
+    "down_fp4": "mlp.experts.down_proj",
+    "down_bs": "mlp.experts.down_proj_weight_scale",
+    "down_gs": "mlp.experts.down_proj_weight_scale_2",
+}
 GLOBAL_KEYS = {
     "embed": PREFIX + "embed_tokens.weight",
     "lm_head": "lm_head.weight",
     "final_norm": PREFIX + "norm.weight",
 }
 EXPERT_NAMES = ("gate_up_q", "gate_up_s", "down_q", "down_s")
+FP4_EXPERT_NAMES = layout.FP4_EXPERT_FAMILIES
 GLOBAL_NAMES = ("embed", "lm_head", "final_norm")
 # Dense per-layer families grouped into pool tasks (each task writes all ranks); the small
 # vector families use the reference's jax helpers and are converted in the main process.
@@ -172,7 +206,8 @@ class Checkpoint:
     """Safetensors index + header parsing and streaming reads of one HF checkpoint."""
 
     DTYPES = {"BF16": BF16, "F32": np.dtype(np.float32), "F16": np.dtype(np.float16),
-              "U8": np.dtype(np.uint8), "I8": np.dtype(np.int8)}
+              "U8": np.dtype(np.uint8), "I8": np.dtype(np.int8), "F8_E4M3": E4M3}
+    NAMES = {v: k for k, v in DTYPES.items()}
 
     def __init__(self, path, config=None):
         self.path = Path(path)
@@ -375,36 +410,41 @@ def global_rank_arrays(cfg, tp, rank, embed_rows, lm_head_rows, final_norm):
 # ---------------------------------------------------------------------------------------
 
 
-def _shapes(cfg, tp):
+def _shapes(cfg, tp, expert_format="int4"):
     """`{name: (per-rank shape, np dtype)}` from `layout.rank_shapes`."""
     out = {}
-    for name, (shape, dtype) in layout.rank_shapes(cfg, tp).items():
+    for name, (shape, dtype) in layout.rank_shapes(cfg, tp, expert_format).items():
         out[name] = (tuple(int(s) for s in shape), np.dtype(dtype))
     return out
 
 
 def disk_spec(shape, dtype):
-    """`(disk shape, disk dtype)`: int4 is nibble-packed along the last axis."""
+    """`(disk shape, disk dtype)`: int4 is nibble-packed along the last axis, e4m3 block
+    scales are stored as their uint8 bits."""
     if np.dtype(dtype) == INT4:
         if shape[-1] % 2:
             raise ValueError("int4 arrays need an even last axis to pack")
         return (*shape[:-1], shape[-1] // 2), np.dtype(np.uint8)
+    if np.dtype(dtype) == E4M3:
+        return tuple(shape), np.dtype(np.uint8)
     return tuple(shape), np.dtype(dtype)
 
 
 def _dtype_name(dtype):
     dtype = np.dtype(dtype)
-    return {BF16: "bfloat16", INT4: "int4"}.get(dtype, dtype.name)
+    return {BF16: "bfloat16", INT4: "int4", E4M3: "float8_e4m3fn"}.get(dtype, dtype.name)
 
 
 def _np_dtype(name):
-    return {"bfloat16": BF16, "int4": INT4}.get(name, np.dtype(name))
+    return {"bfloat16": BF16, "int4": INT4, "float8_e4m3fn": E4M3}.get(name, np.dtype(name))
 
 
-def make_layout(cfg, tp, revision=None):
-    """The `layout.json` document of a container for `cfg`/`tp`."""
+def make_layout(cfg, tp, revision=None, expert_format="int4", expert_source=None):
+    """The `layout.json` document of a container for `cfg`/`tp` (`expert_format` "int4" ->
+    format v1, "nvfp4" -> format v2; `expert_source` documents, per layer, where the nvfp4
+    experts came from: "vendor" or "rtn" (quantized from bf16 by `quant.quantize_nvfp4_np`))."""
     arrays = {}
-    for name, (shape, dtype) in _shapes(cfg, tp).items():
+    for name, (shape, dtype) in _shapes(cfg, tp, expert_format).items():
         dshape, ddtype = disk_spec(shape, dtype)
         arrays[name] = {
             "shape": list(shape),
@@ -416,8 +456,8 @@ def make_layout(cfg, tp, revision=None):
             "layer_axis": 0 if name not in GLOBAL_NAMES else None,
         }
     cfg_dict = {k: (list(v) if isinstance(v, tuple) else v) for k, v in cfg.__dict__.items()}
-    return {
-        "format": FORMAT,
+    doc = {
+        "format": FORMAT if expert_format == "int4" else FORMAT_V2,
         "config": cfg_dict,
         "tp": tp,
         "group": cfg.group_size,
@@ -427,14 +467,31 @@ def make_layout(cfg, tp, revision=None):
         "arrays": arrays,
         "total_bytes": tp * sum(a["nbytes"] for a in arrays.values()),
     }
+    if expert_format != "int4":
+        doc["expert_format"] = expert_format
+        doc["fp4"] = FP4_ENCODING
+        doc["fp4_block"] = layout.FP4_BLOCK
+        doc["expert_source"] = expert_source or {}
+        doc["layer_kinds"] = ["nvfp4"] * cfg.layers
+    return doc
 
 
 def read_layout(directory):
     directory = Path(directory)
     doc = json.loads((directory / "layout.json").read_text())
-    if doc.get("format") != FORMAT:
+    if doc.get("format") not in FORMATS:
         raise ValueError(f"{directory}: unexpected container format {doc.get('format')!r}")
     return doc
+
+
+def layout_expert_format(doc):
+    """`"int4"` (format v1) or `"nvfp4"` (format v2) of a layout document."""
+    return doc.get("expert_format", "int4")
+
+
+def container_expert_format(directory):
+    """The expert format of the container at `directory` (`layout_expert_format`)."""
+    return layout_expert_format(read_layout(directory))
 
 
 def config_from_layout(doc):
@@ -753,6 +810,8 @@ def read_rank_array(directory, rank, name, index=None, doc=None, unpack=True):
     value = np.array(mm if index is None else mm[index])
     if spec["dtype"] == "int4" and unpack:
         value = quant.unpack_int4(value, INT4)
+    elif spec["dtype"] == "float8_e4m3fn" and unpack:
+        value = value.view(E4M3)
     return value
 
 
@@ -788,10 +847,26 @@ def _load_rank(directory, doc, rank, device, layer_chunk_bytes, log):
         shape, dtype = tuple(spec["shape"]), _np_dtype(spec["dtype"])
         dshape, ddtype = tuple(spec["disk_shape"]), np.dtype(spec["disk_dtype"])
         per_layer = int(np.prod(dshape[1:])) * ddtype.itemsize if spec["layer_axis"] == 0 else 0
-        if dtype != INT4:
-            value = _read_file(path, dtype=ddtype).reshape(dshape)
+        host_dtype = E4M3 if dtype == E4M3 else ddtype  # e4m3 bits are viewed, never converted
+        if dtype != INT4 and (spec["nbytes"] <= layer_chunk_bytes or spec["layer_axis"] != 0):
+            value = _read_file(path, dtype=host_dtype).reshape(dshape)
             arrays[name] = jax.device_put(value[None], device)
             del value
+        elif dtype != INT4:
+            # Stream one layer at a time into a preallocated device buffer (donated).
+            jdtype = jnp.dtype(host_dtype)
+            buffer = jax.jit(lambda: jnp.zeros((1, *shape), jdtype), out_shardings=placement)()
+
+            def update(buffer, chunk, index):
+                start = (0, index) + (0,) * (buffer.ndim - 2)
+                return jax.lax.dynamic_update_slice(buffer, chunk[None, None], start)
+
+            update = jax.jit(update, donate_argnums=0, out_shardings=placement)
+            for l in range(shape[0]):
+                chunk = _read_file(path, l * per_layer, per_layer, host_dtype).reshape(dshape[1:])
+                buffer = update(buffer, jax.device_put(chunk, device), jnp.int32(l))
+                del chunk
+            arrays[name] = buffer
         elif spec["nbytes"] <= layer_chunk_bytes or spec["layer_axis"] != 0:
             packed = jax.device_put(_read_file(path).reshape(dshape)[None], device)
             arrays[name] = jax.jit(quant.unpack_int4_jnp, out_shardings=placement)(packed)
@@ -820,13 +895,16 @@ def _load_rank(directory, doc, rank, device, layer_chunk_bytes, log):
 def load_presharded(mesh, directory, cfg=None, *, ranks_in_flight=8, layer_chunk_bytes=1 << 30,
                     log=None):
     """The container at `directory` as `{name: jax.Array[tp, ...]}` sharded `P("tp")` over
-    `mesh` (rank r's arrays live on `mesh.devices.flat[r]`). int4 arrays are `jnp.int4`."""
+    `mesh` (rank r's arrays live on `mesh.devices.flat[r]`). int4 arrays are `jnp.int4`; a v2
+    (nvfp4) container yields int32 packed codes, `float8_e4m3fn` block scales and f32 `expert_gs`
+    (`layout.FP4_EXPERT_FAMILIES`) instead of the int4 families."""
     directory = Path(directory)
     doc = read_layout(directory)
     if not read_progress(directory).get("complete"):
         raise ValueError(f"{directory}: conversion is not complete (see progress.json)")
     tp = doc["tp"]
-    if cfg is not None and make_layout(cfg, tp)["arrays"] != doc["arrays"]:
+    fmt = layout_expert_format(doc)
+    if cfg is not None and make_layout(cfg, tp, expert_format=fmt)["arrays"] != doc["arrays"]:
         raise ValueError(f"{directory}: container layout does not match the requested config")
     devices = list(mesh.devices.flat)
     if len(devices) != tp:
@@ -851,12 +929,13 @@ def load_presharded(mesh, directory, cfg=None, *, ranks_in_flight=8, layer_chunk
     return weights
 
 
-def abstract_weights(mesh, cfg, tp=None):
-    """`jax.ShapeDtypeStruct` tree matching `load_presharded`, for AOT compilation."""
+def abstract_weights(mesh, cfg, tp=None, expert_format="int4"):
+    """`jax.ShapeDtypeStruct` tree matching `load_presharded`, for AOT compilation
+    (`expert_format` of the container: `container_expert_format`)."""
     tp = tp or mesh.size
     sharding = NamedSharding(mesh, P("tp"))
     out = {}
-    for name, (shape, dtype) in _shapes(cfg, tp).items():
+    for name, (shape, dtype) in _shapes(cfg, tp, expert_format).items():
         jdtype = jnp.int4 if dtype == INT4 else jnp.dtype(dtype)
         out[name] = jax.ShapeDtypeStruct((tp, *shape), jdtype, sharding=sharding)
     return out
@@ -906,9 +985,26 @@ def load_tokenizer(directory):
 # ---------------------------------------------------------------------------------------
 
 
-def checkpoint_tensor_specs(cfg):
-    """`{name: (shape, np dtype)}` of every text-model tensor of an HF checkpoint for `cfg`."""
+def nvfp4_layers(cfg):
+    """Layers whose experts the vendor NVFP4 checkpoint quantizes: all but the first and last."""
+    return tuple(range(1, cfg.layers - 1))
+
+
+def checkpoint_tensor_specs(cfg, nvfp4=False):
+    """`{name: (shape, np dtype)}` of every text-model tensor of an HF checkpoint for `cfg`
+    (`nvfp4`: the experts of `nvfp4_layers(cfg)` in the vendor's NVFP4 tensor set)."""
     h, hm, i, e = cfg.hidden, cfg.moe_hidden, cfg.expert_hidden, cfg.experts
+    f32, u8 = np.dtype(np.float32), np.dtype(np.uint8)
+    nvfp4_experts = {
+        "mlp.experts.gate_up_proj": ((e, 2 * i, hm // 2), u8),
+        "mlp.experts.gate_up_proj_weight_scale": ((e, 2 * i, hm // 16), E4M3),
+        "mlp.experts.gate_up_proj_weight_scale_2": ((e, 2), f32),
+        "mlp.experts.gate_up_proj_input_scale": ((e, 2), f32),
+        "mlp.experts.down_proj": ((e, hm, i // 2), u8),
+        "mlp.experts.down_proj_weight_scale": ((e, hm, i // 16), E4M3),
+        "mlp.experts.down_proj_weight_scale_2": ((e,), f32),
+        "mlp.experts.down_proj_input_scale": ((e,), f32),
+    }
     per_layer = {
         "input_layernorm.weight": ((h,), BF16),
         "self_attn.q_proj.weight": ((cfg.q_width, h), BF16),
@@ -940,12 +1036,16 @@ def checkpoint_tensor_specs(cfg):
     return specs
 
 
-def random_checkpoint_tensors(cfg, seed=0):
+def random_checkpoint_tensors(cfg, seed=0, nvfp4=False):
     """Deterministic random HF-named tensors for `cfg` (bf16 weights ~N(0, 0.05); the
-    router f32 with a non-bf16-representable fraction; norms/gates around zero)."""
+    router f32 with a non-bf16-representable fraction; norms/gates around zero). With
+    `nvfp4` the experts of `nvfp4_layers(cfg)` are NVFP4 tensors: random Gaussian experts
+    quantized with `quant.quantize_nvfp4_np` in the checkpoint's `[out, in]` orientation."""
     rng = np.random.default_rng(seed)
     tensors = {}
-    for name, (shape, dtype) in checkpoint_tensor_specs(cfg).items():
+    for name, (shape, dtype) in checkpoint_tensor_specs(cfg, nvfp4).items():
+        if dtype == np.uint8 or dtype == E4M3 or name.endswith(("_scale_2", "_scale")):
+            continue  # filled below from the quantizer
         if dtype == np.float32:
             value = rng.standard_normal(shape, np.float32) * np.float32(0.05)
         elif len(shape) == 1:
@@ -953,14 +1053,59 @@ def random_checkpoint_tensors(cfg, seed=0):
         else:
             value = rng.standard_normal(shape, np.float32) * np.float32(0.05)
         tensors[name] = value.astype(dtype)
+    if nvfp4:
+        e, i, hm = cfg.experts, cfg.expert_hidden, cfg.moe_hidden
+        for layer in nvfp4_layers(cfg):
+            p = f"{PREFIX}layers.{layer}.mlp.experts."
+            for kind, out_rows, in_cols, halves in (("gate_up", 2 * i, hm, 2), ("down", hm, i, 1)):
+                # Blocks run along `in`: quantize the transposed `[E, in, out]` (K = in) per
+                # half (gate / up global scales) and pack the codes back along `in`.
+                w = rng.standard_normal((e, out_rows, in_cols), np.float32) * np.float32(0.05)
+                w = w.astype(BF16).astype(np.float32)
+                wt = np.ascontiguousarray(w.transpose(0, 2, 1))  # [E, in, out]
+                packed_parts, bs_parts, gs_parts = [], [], []
+                width = out_rows // halves
+                for hf in range(halves):
+                    pk, bs, gs = quant.quantize_nvfp4_np(wt[..., hf * width:(hf + 1) * width])
+                    packed_parts.append(pk)
+                    bs_parts.append(bs)
+                    gs_parts.append(gs)
+                codes = quant.unpack_fp4_rows(np.concatenate(packed_parts, axis=-1))  # [E, in, out]
+                codes = codes.transpose(0, 2, 1)  # [E, out, in]
+                lo, hi = codes[..., 0::2], codes[..., 1::2]
+                tensors[p + f"{kind}_proj"] = np.ascontiguousarray(lo | (hi << 4)).astype(np.uint8)
+                bs = np.concatenate(bs_parts, axis=-1).transpose(0, 2, 1)  # [E, out, in/16]
+                tensors[p + f"{kind}_proj_weight_scale"] = np.ascontiguousarray(bs)
+                gs = np.stack(gs_parts, axis=-1) if halves > 1 else gs_parts[0]
+                tensors[p + f"{kind}_proj_weight_scale_2"] = gs.astype(np.float32)
+                tensors[p + f"{kind}_proj_input_scale"] = np.full(gs.shape, 0.01, np.float32)
     return tensors
 
 
-def write_checkpoint(directory, cfg, tensors, shards=3):
-    """Write `tensors` as an HF safetensors checkpoint (`model-0000k-of-0000n.safetensors` +
-    `model.safetensors.index.json` + a `config.json` that `Config.from_checkpoint` accepts)."""
-    from safetensors.numpy import save_file
+def save_safetensors(path, tensors):
+    """Minimal safetensors writer (numpy, incl. ml_dtypes bf16/e4m3 which `safetensors.numpy`
+    may not know): header JSON + raw little-endian data."""
+    header, offset = {}, 0
+    order = sorted(tensors)
+    for name in order:
+        a = np.ascontiguousarray(tensors[name])
+        header[name] = {"dtype": Checkpoint.NAMES[np.dtype(a.dtype)], "shape": list(a.shape),
+                        "data_offsets": [offset, offset + a.nbytes]}
+        offset += a.nbytes
+    header["__metadata__"] = {"format": "np"}
+    blob = json.dumps(header, separators=(",", ":")).encode()
+    blob += b" " * ((8 - len(blob) % 8) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)))
+        f.write(blob)
+        for name in order:
+            f.write(_array_bytes(tensors[name]).tobytes())
 
+
+def write_checkpoint(directory, cfg, tensors, shards=3, nvfp4=False):
+    """Write `tensors` as an HF safetensors checkpoint (`model-0000k-of-0000n.safetensors` +
+    `model.safetensors.index.json` + a `config.json` that `Config.from_checkpoint` accepts;
+    `nvfp4` adds the vendor's `hf_quant_config.json`)."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     names = sorted(tensors)
@@ -968,7 +1113,7 @@ def write_checkpoint(directory, cfg, tensors, shards=3):
     for k in range(shards):
         filename = f"model-{k + 1:05d}-of-{shards:05d}.safetensors"
         part = {n: tensors[n] for n in names[k::shards]}
-        save_file(part, str(directory / filename))
+        save_safetensors(directory / filename, part)
         for n in part:
             weight_map[n] = filename
             total += tensors[n].nbytes
@@ -997,6 +1142,13 @@ def write_checkpoint(directory, cfg, tensors, shards=3):
     }
     (directory / "config.json").write_text(json.dumps({"text_config": text}))
     (directory / "generation_config.json").write_text(json.dumps({"eos_token_id": list(cfg.eos)}))
+    if nvfp4:
+        (directory / "hf_quant_config.json").write_text(json.dumps({
+            "quant_method": "modelopt",
+            "quantization": {"quant_algo": "NVFP4", "group_size": 16, "kv_cache_quant_algo": None,
+                             "exclude_modules": [f"layers.{l}." for l in range(cfg.layers)
+                                                 if l not in nvfp4_layers(cfg)]},
+        }))
     return directory
 
 
@@ -1031,6 +1183,542 @@ def synthetic_presharded(tmpdir, cfg, tp, seed=0, **convert_kwargs):
     return src, dst, tensors
 
 
+def synthetic_presharded_nvfp4(tmpdir, cfg, tp, seed=0, shards=5, **convert_kwargs):
+    """Synthetic NVFP4-format HF checkpoint -> format-v2 container under `tmpdir`;
+    returns `(checkpoint_dir, container_dir, tensors)`."""
+    tmpdir = Path(tmpdir)
+    src, dst = tmpdir / "checkpoint-nvfp4", tmpdir / f"presharded-nvfp4-tp{tp}"
+    tensors = random_checkpoint_tensors(cfg, seed, nvfp4=True)
+    write_checkpoint(src, cfg, tensors, shards, nvfp4=True)
+    convert_presharded_nvfp4(src, dst, tp=tp, config=cfg, log=lambda _: None, **convert_kwargs)
+    return src, dst, tensors
+
+
+# ---------------------------------------------------------------------------------------
+# NVFP4 (container format v2): per-rank expert re-layout and RTN quantization of bf16 experts
+# ---------------------------------------------------------------------------------------
+
+
+def expert_gs_tile(gate, up, down):
+    """`[8, 128]` f32 `expert_gs` tile: row 0 = gate, 1 = up, 2 = down global scale."""
+    tile = np.zeros((layout.GS_ROWS, layout.GS_LANES), np.float32)
+    tile[0], tile[1], tile[2] = np.float32(gate), np.float32(up), np.float32(down)
+    return tile
+
+
+def nvfp4_expert_rank_arrays(cfg, tp, rank, gate_up=None, gate_up_scale=None, down=None,
+                             down_scale=None):
+    """One rank's fp4 families of ONE vendor-quantized expert (pure byte re-layout).
+
+    Checkpoint tensors (nn.Linear `[out, in]`, K packed low-nibble-first): `gate_up [2I, Hm/2]`
+    uint8, `gate_up_scale [2I, Hm/16]` e4m3, `down [Hm, I/2]` uint8, `down_scale [Hm, I/16]`
+    e4m3 -> `gate_up_fp4 [Hm/8, 2*Is]` int32, `gate_up_bs [Hm/KC, KC/16, 2*Is]` e4m3 (uint8 bits
+    on disk), `down_fp4 [Is/8, Hm]`, `down_bs [Is/KC, KC/16, Hm]`; only the families whose
+    inputs are given are returned."""
+    i_s, i_full, hm = cfg.expert_hidden // tp, cfg.expert_hidden, cfg.moe_hidden
+    gate_rows = slice(rank * i_s, (rank + 1) * i_s)
+    up_rows = slice(i_full + rank * i_s, i_full + (rank + 1) * i_s)
+    out = {}
+    if gate_up is not None:
+        rows = np.concatenate([gate_up[gate_rows], gate_up[up_rows]], axis=0)  # [2*Is, Hm/2]
+        out["gate_up_fp4"] = quant.nvfp4_rows_to_packed(rows)  # [Hm/8, 2*Is]
+    if gate_up_scale is not None:
+        sc = np.asarray(gate_up_scale).view(np.uint8)
+        sc = np.ascontiguousarray(np.concatenate([sc[gate_rows], sc[up_rows]], axis=0).T)
+        out["gate_up_bs"] = quant.fp4_scales_to_chunked(sc, hm).view(E4M3)
+    if down is not None:
+        cols = np.asarray(down, np.uint8)[:, rank * (i_s // 2):(rank + 1) * (i_s // 2)]
+        out["down_fp4"] = quant.nvfp4_rows_to_packed(cols)  # [Is/8, Hm]
+    if down_scale is not None:
+        sc = np.asarray(down_scale).view(np.uint8)
+        sc = np.ascontiguousarray(sc[:, rank * (i_s // 16):(rank + 1) * (i_s // 16)].T)
+        out["down_bs"] = quant.fp4_scales_to_chunked(sc, i_s).view(E4M3)
+    return out
+
+
+def nvfp4_expert_rank_arrays_slow(cfg, tp, rank, gate_up=None, gate_up_scale=None, down=None,
+                                  down_scale=None):
+    """Reference for `nvfp4_expert_rank_arrays` via explicit nibble unpacking/transposes."""
+    i_s, i_full, hm = cfg.expert_hidden // tp, cfg.expert_hidden, cfg.moe_hidden
+    cols = np.r_[rank * i_s:(rank + 1) * i_s, i_full + rank * i_s:i_full + (rank + 1) * i_s]
+    out = {}
+    if gate_up is not None:
+        codes = quant.unpack_nvfp4_codes(gate_up)[cols].T  # [Hm, 2*Is]
+        out["gate_up_fp4"] = quant.pack_fp4_rows(codes)
+    if gate_up_scale is not None:
+        gs = np.ascontiguousarray(np.asarray(gate_up_scale).view(np.uint8)[cols].T)  # [Hm/16, 2*Is]
+        out["gate_up_bs"] = quant.fp4_scales_to_chunked(gs, hm).view(E4M3)
+    if down is not None:
+        dn = quant.unpack_nvfp4_codes(down)[:, rank * i_s:(rank + 1) * i_s].T  # [Is, Hm]
+        out["down_fp4"] = quant.pack_fp4_rows(dn)
+    if down_scale is not None:
+        ds = np.asarray(down_scale).view(np.uint8)[:, rank * (i_s // 16):(rank + 1) * (i_s // 16)].T
+        out["down_bs"] = quant.fp4_scales_to_chunked(np.ascontiguousarray(ds), i_s).view(E4M3)
+    return out
+
+
+def bf16_expert_to_nvfp4(cfg, tp, gate_up, down):
+    """Quantize ONE bf16 expert (`gate_up [2I, Hm]`, `down [Hm, I]`, checkpoint layout) to the
+    NVFP4 container format with `quant.quantize_nvfp4_np` (modelopt formula: one global scale
+    per gate half / up half / down tensor from the FULL tensor's amax, like the vendor) ->
+    `{rank: {family: array}}` for all ranks including `expert_gs`."""
+    i_s, i_full, hm = cfg.expert_hidden // tp, cfg.expert_hidden, cfg.moe_hidden
+    gu = np.ascontiguousarray(_bf16(gate_up).T, dtype=np.float32)  # [Hm, 2I]
+    halves = [quant.quantize_nvfp4_np(gu[:, :i_full]), quant.quantize_nvfp4_np(gu[:, i_full:])]
+    dn_packed, dn_bs, dn_gs = quant.quantize_nvfp4_np(
+        np.ascontiguousarray(_bf16(down).T, dtype=np.float32)  # [I, Hm]
+    )
+    tile = expert_gs_tile(halves[0][2], halves[1][2], dn_gs)
+    out = {}
+    for rank in range(tp):
+        cols = slice(rank * i_s, (rank + 1) * i_s)
+        gu_packed = np.concatenate([halves[0][0][:, cols], halves[1][0][:, cols]], axis=1)
+        gu_bs = np.concatenate([halves[0][1][:, cols], halves[1][1][:, cols]], axis=1)
+        out[rank] = {
+            "gate_up_fp4": np.ascontiguousarray(gu_packed),
+            "gate_up_bs": quant.fp4_scales_to_chunked(np.ascontiguousarray(gu_bs), hm),
+            "down_fp4": np.ascontiguousarray(dn_packed[rank * (i_s // 8):(rank + 1) * (i_s // 8)]),
+            "down_bs": quant.fp4_scales_to_chunked(
+                np.ascontiguousarray(dn_bs[rank * (i_s // 16):(rank + 1) * (i_s // 16)]), i_s
+            ),
+            "expert_gs": tile,
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------------------
+# NVFP4 streaming converter
+# ---------------------------------------------------------------------------------------
+
+
+def safetensors_header(path):
+    """`(header dict, data start offset)` of one safetensors file."""
+    with open(path, "rb") as f:
+        size = struct.unpack("<Q", f.read(8))[0]
+        return json.loads(f.read(size)), 8 + size
+
+
+def _meta_from_header(path, header, base, key):
+    entry = header[key]
+    start, end = entry["data_offsets"]
+    return (os.fspath(path), base + start, end - start, Checkpoint.DTYPES[entry["dtype"]],
+            tuple(entry["shape"]))
+
+
+def read_meta(meta, rows=None, threads=8):
+    """A tensor (or its leading-axis slice `rows`) described by a `(path, offset, nbytes,
+    dtype, shape)` tuple as a numpy array (positional reads, no mmap)."""
+    path, offset, nbytes, dtype, shape = meta
+    shape = list(shape)
+    if rows is not None:
+        r0, r1, step = rows.indices(shape[0])
+        if step != 1:
+            raise ValueError("only unit-step leading slices are supported")
+        row_bytes = nbytes // shape[0]
+        offset, nbytes, shape[0] = offset + r0 * row_bytes, (r1 - r0) * row_bytes, r1 - r0
+    out = np.empty(shape, dtype)
+    if nbytes:
+        _read_ranges([(path, offset, memoryview(out.view(np.uint8).reshape(-1)))], threads)
+    return out
+
+
+def _lazy_tensors(metas):
+    class Lazy(dict):
+        def __missing__(self, suffix):
+            self[suffix] = read_meta(metas[suffix])
+            return self[suffix]
+
+    return Lazy()
+
+
+class ShardSource:
+    """Shards of an HF checkpoint: a local directory (all files present, never deleted) or a
+    Hub repo id (`fetch` downloads into the HF cache, `release` deletes the blob again)."""
+
+    METADATA = ("config.json", "generation_config.json", "model.safetensors.index.json",
+                "hf_quant_config.json", "tokenizer.json", "tokenizer_config.json",
+                "special_tokens_map.json", "chat_template.jinja")
+
+    def __init__(self, src, revision=None, log=print):
+        self.log = log
+        self.local = Path(src).is_dir()
+        self.sizes = {}
+        if self.local:
+            self.dir = Path(src)
+            self.repo = None
+        else:
+            from huggingface_hub import HfApi, hf_hub_download
+
+            self.repo, self._download = src, hf_hub_download
+            info = HfApi().model_info(src, revision=revision, files_metadata=True)
+            self.sizes = {f.rfilename: int(f.size or 0) for f in info.siblings}
+            self.hub_revision = info.sha
+            for name in self.METADATA:
+                if name in self.sizes:
+                    path = hf_hub_download(src, name, revision=self.hub_revision)
+            self.dir = Path(path).parent
+        self.index = json.loads((self.dir / "model.safetensors.index.json").read_text())["weight_map"]
+        self.revision = hashlib.sha256(
+            (self.dir / "model.safetensors.index.json").read_bytes()).hexdigest()[:16]
+
+    def size(self, filename):
+        if self.local:
+            return (self.dir / filename).stat().st_size
+        return self.sizes.get(filename, 0)
+
+    def present(self, filename):
+        path = self.dir / filename
+        return path.is_file() and (self.local or path.stat().st_size == self.size(filename))
+
+    def fetch(self, filename):
+        """Path of the shard, downloading it first in Hub mode (resumable)."""
+        if self.local:
+            return self.dir / filename
+        return Path(self._download(self.repo, filename, revision=self.hub_revision))
+
+    def release(self, filename):
+        """Delete a downloaded shard (symlink and blob); local sources are untouched."""
+        if self.local:
+            return
+        link = self.dir / filename
+        if link.is_symlink() or link.exists():
+            target = link.resolve()
+            link.unlink(missing_ok=True)
+            if target.exists() and target != link:
+                target.unlink()
+        blobs = self.dir.parent.parent / "blobs"
+        if blobs.is_dir():
+            for part in blobs.glob("*.incomplete"):
+                if part.stat().st_mtime < time.time() - 3600:
+                    part.unlink(missing_ok=True)
+
+
+def _is_nvfp4_layer(index, layer):
+    return layer_key(layer, NVFP4_SUFFIXES["gate_up_bs"]) in index
+
+
+def nvfp4_units(cfg, index):
+    """Conversion units of an NVFP4 checkpoint: `{unit id: (kind, layer, [keys])}`; every unit
+    runs once all of its checkpoint tensors are on disk and writes a disjoint part of the
+    container."""
+    units = {}
+    for name in GLOBAL_NAMES:
+        units[f"global:{name}"] = ("global", name, [GLOBAL_KEYS[name]])
+    for layer in range(cfg.layers):
+        units[f"dense:{layer}"] = ("dense", layer, [layer_key(layer, s) for s in DENSE_SUFFIXES])
+        if _is_nvfp4_layer(index, layer):
+            for family in ("gate_up_fp4", "gate_up_bs", "down_fp4", "down_bs"):
+                units[f"fp4:{layer}:{family}"] = (
+                    "fp4", layer, [layer_key(layer, NVFP4_SUFFIXES[family])], family)
+            units[f"gs:{layer}"] = ("gs", layer, [layer_key(layer, NVFP4_SUFFIXES["gate_up_gs"]),
+                                                  layer_key(layer, NVFP4_SUFFIXES["down_gs"])])
+        else:
+            units[f"bf16:{layer}"] = ("bf16", layer, [layer_key(layer, s) for s in EXPERT_SUFFIXES])
+    missing = sorted({k for u in units.values() for k in u[2] if k not in index})
+    if missing:
+        raise KeyError(f"checkpoint index lacks {len(missing)} tensors, e.g. {missing[:3]}")
+    return units
+
+
+def _worker_init_v2(cfg, tp, dst, doc):
+    _SHARED.buffers, _SHARED.shms, _SHARED.plan = None, [], None
+    _SHARED.cfg, _SHARED.tp, _SHARED.dst, _SHARED.layout, _SHARED.fds = cfg, tp, dst, doc, {}
+
+
+def _fp4_task(args):
+    """Vendor fp4 tensors of experts `e0:e1` of one family -> every rank's slice."""
+    family, layer, e0, e1, meta = args
+    cfg, tp = _SHARED.cfg, _SHARED.tp
+    arg = FP4_TASK_ARGS[family]
+    written = 0
+    for e in range(e0, e1):
+        tensor = read_meta(meta, slice(e, e + 1))[0]
+        for rank in range(tp):
+            value = nvfp4_expert_rank_arrays(cfg, tp, rank, **{arg: tensor})[family]
+            written += _write_rank_array(rank, family, layer, value, expert=e)
+    return written
+
+
+def _bf16_expert_task(args):
+    """bf16 experts `e0:e1` of a non-quantized layer -> NVFP4 (RTN) for every rank."""
+    layer, e0, e1, meta_gu, meta_dn = args
+    cfg, tp = _SHARED.cfg, _SHARED.tp
+    written = 0
+    for e in range(e0, e1):
+        gu = read_meta(meta_gu, slice(e, e + 1))[0]
+        dn = read_meta(meta_dn, slice(e, e + 1))[0]
+        for rank, arrays in bf16_expert_to_nvfp4(cfg, tp, gu, dn).items():
+            for name, value in arrays.items():
+                written += _write_rank_array(rank, name, layer, value, expert=e)
+    return written
+
+
+def _dense_task_v2(args):
+    layer, names, metas = args
+    cfg, tp = _SHARED.cfg, _SHARED.tp
+    tensors = _lazy_tensors(metas)
+    written = 0
+    for rank in range(tp):
+        for name, value in dense_rank_arrays(cfg, tp, rank, tensors, names).items():
+            written += _write_rank_array(rank, name, layer, value)
+    return written
+
+
+def _global_task(args):
+    name, meta = args
+    cfg, tp = _SHARED.cfg, _SHARED.tp
+    written = 0
+    vp = layout.vocab_pad(cfg, tp)
+    for rank in range(tp):
+        if name == "final_norm":
+            value = _bf16(read_meta(meta)).reshape(1, -1)
+        else:
+            rows = slice(rank * vp, min((rank + 1) * vp, cfg.vocab))
+            value = np.zeros((vp, cfg.hidden), BF16)
+            if rows.start < cfg.vocab:
+                value[:rows.stop - rows.start] = _bf16(read_meta(meta, rows, threads=16))
+            if name == "lm_head":
+                value = np.ascontiguousarray(value.T)
+        data = _array_bytes(value)
+        spec = _SHARED.layout["arrays"][name]
+        if len(data) != spec["nbytes"]:
+            raise ValueError(f"{name}: {len(data)} bytes != {spec['nbytes']}")
+        _pwrite_all(_worker_fd(rank, name), data, 0)
+        written += len(data)
+    return written
+
+
+def _free_bytes(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+FP4_TASK_ARGS = {"gate_up_fp4": "gate_up", "gate_up_bs": "gate_up_scale", "down_fp4": "down",
+                 "down_bs": "down_scale"}
+
+
+def _fp4_self_check(cfg, tp, dst, doc, layer, family, meta, experts=(0,)):
+    """Compare the container's `family` of a few experts against the slow reference path
+    recomputed from the source tensor; returns the mismatching (expert, rank) list."""
+    bad = []
+    for e in experts:
+        tensor = read_meta(meta, slice(e, e + 1))[0]
+        for rank in (0, tp - 1):
+            want = nvfp4_expert_rank_arrays_slow(cfg, tp, rank, **{FP4_TASK_ARGS[family]: tensor})
+            got = read_rank_array(dst, rank, family, (layer, e), doc, unpack=False)
+            if not np.array_equal(got, np.asarray(want[family]).view(got.dtype)):
+                bad.append(f"{family}[{layer},{e}]@rank{rank}")
+    return bad
+
+
+def convert_presharded_nvfp4(src, dst_dir, tp=8, workers=None, experts_per_task=4,
+                             max_shards=3, min_free_bytes=8 << 30, shards=None, self_check=True,
+                             config=None, log=print):
+    """Stream the NVFP4 checkpoint `src` (a Hub repo id such as `NVFP4_REPO`, or a local
+    directory holding every shard) into the format-v2 container `dst_dir`.
+
+    Shards are processed in index order; in Hub mode each is downloaded into the HF cache
+    (`HF_HOME`), converted and deleted, with at most `max_shards` shards on disk (a shard is
+    kept until every unit that needs one of its tensors has run, e.g. a layer whose dense
+    tensors straddle two shards) and a free-space guard (`min_free_bytes` beyond the
+    container's unwritten bytes) before every download. `shards` limits the run to the first
+    n shards (tests); `config` overrides the checkpoint's `Config` (tests). Progress is per
+    unit in `progress.json`; re-running resumes. Returns the progress doc. Uses a spawned
+    process pool (call from a guarded `__main__`).
+    """
+    started = time.perf_counter()
+    source = ShardSource(src, log=log)
+    if config is None:
+        raw = json.loads((source.dir / "config.json").read_text())
+        vocab = raw.get("text_config", raw)["vocab_size"]
+        config = Config.from_checkpoint(source.dir, vocab_used=min(Config().vocab_used, vocab))
+    cfg = config
+    dst = Path(dst_dir)
+    dst.mkdir(parents=True, exist_ok=True)
+    layers_src = {str(l): ("vendor" if _is_nvfp4_layer(source.index, l) else "rtn")
+                  for l in range(cfg.layers)}
+    doc = make_layout(cfg, tp, revision=source.revision, expert_format="nvfp4",
+                      expert_source=layers_src)
+    if is_presharded(dst):
+        existing = read_layout(dst)
+        for key in ("format", "config", "tp", "arrays"):
+            if existing.get(key) != doc[key]:
+                raise ValueError(f"{dst}: existing container differs in {key}; use a new dst")
+        if existing.get("revision") != doc["revision"]:
+            raise ValueError(f"{dst}: existing container was converted from another revision")
+    else:
+        _write_json(dst / "layout.json", doc)
+    for name in ShardSource.METADATA:
+        if (source.dir / name).exists() and not (dst / name).exists():
+            (dst / name).write_bytes((source.dir / name).read_bytes())
+    _allocate_files(dst, doc)
+    progress = read_progress(dst)
+    progress.setdefault("units", [])
+    progress.setdefault("bytes_written", 0)
+    progress.setdefault("bytes_downloaded", 0)
+    progress.setdefault("elapsed", 0.0)
+    done = set(progress["units"])
+    units = nvfp4_units(cfg, source.index)
+    order = sorted({source.index[k] for u in units.values() for k in u[2]})
+    if shards is not None:
+        order = order[:shards]
+    users = {f: [uid for uid, u in units.items() if any(source.index[k] == f for k in u[2])]
+             for f in order}
+    todo = [f for f in order if any(uid not in done for uid in users[f])]
+    total_bytes = doc["total_bytes"]
+    log(f"convert nvfp4 {src} -> {dst}: tp={tp}, {len(units)} units ({len(done)} done), "
+        f"{len(todo)}/{len(order)} shards to process, container {total_bytes / 1e9:.1f} GB, "
+        f"free {_free_bytes(dst) / 1e9:.1f} GB")
+
+    def save_progress():
+        progress["units"] = sorted(done)
+        progress["layers"] = sorted(
+            l for l in range(cfg.layers)
+            if all(uid in done for uid, u in units.items() if u[0] != "global" and u[1] == l))
+        progress["globals"] = all(f"global:{n}" in done for n in GLOBAL_NAMES)
+        progress["complete"] = len(done) == len(units)
+        _write_json(dst / "progress.json", progress)
+
+    if not todo:
+        save_progress()
+        return progress
+
+    # Prefetcher: downloads shards ahead of the converter, bounded by the on-disk count and
+    # the free-space guard; the converter's `need` event bypasses the count bound.
+    lock = threading.Condition()
+    on_disk, fetched, failure = {}, {}, []
+    need = {"shard": None}
+
+    def fetch_all():
+        try:
+            for f in todo:
+                with lock:
+                    while (len(on_disk) + 1 > max_shards and need["shard"] != f):
+                        lock.wait(1.0)
+                    while True:
+                        free = _free_bytes(dst) - (total_bytes - progress["bytes_written"])
+                        if source.present(f) or free >= source.size(f) + min_free_bytes:
+                            break
+                        log(f"waiting for disk space: {free / 1e9:.1f} GB free beyond the "
+                            f"container, need {(source.size(f) + min_free_bytes) / 1e9:.1f} GB")
+                        lock.wait(30.0)
+                t0 = time.perf_counter()
+                path = source.fetch(f)
+                dt = time.perf_counter() - t0
+                with lock:
+                    on_disk[f] = path
+                    fetched[f] = (dt, source.size(f))
+                    lock.notify_all()
+        except BaseException as error:  # noqa: BLE001
+            failure.append(error)
+            with lock:
+                lock.notify_all()
+
+    workers = workers or max(1, min(os.cpu_count() - 8, 128))
+    ctx = multiprocessing.get_context("spawn")
+    init_args = (cfg, tp, dst, doc)
+    e_chunks = [(e, min(e + experts_per_task, cfg.experts))
+                for e in range(0, cfg.experts, experts_per_task)]
+    headers = {}
+    shard_times, written_total = [], 0
+
+    def meta(key):
+        f = source.index[key]
+        if f not in headers:
+            headers[f] = safetensors_header(on_disk[f])
+        header, base = headers[f]
+        return _meta_from_header(on_disk[f], header, base, key)
+
+    threading.Thread(target=fetch_all, daemon=True).start()
+    try:
+        with ctx.Pool(workers, initializer=_worker_init_v2, initargs=init_args) as pool:
+            _worker_init_v2(*init_args)
+            for i, f in enumerate(todo):
+                with lock:
+                    need["shard"] = f
+                    lock.notify_all()
+                    while f not in on_disk and not failure:
+                        lock.wait(1.0)
+                    if failure:
+                        raise failure[0]
+                    need["shard"] = None
+                t0 = time.perf_counter()
+                runnable = [uid for uid in units if uid not in done
+                            and all(source.index[k] in on_disk for k in units[uid][2])]
+                results, written = [], 0
+                for uid in runnable:
+                    kind, layer, keys, *rest = units[uid]
+                    if kind == "fp4":
+                        family = rest[0]
+                        m = meta(keys[0])
+                        results += [pool.apply_async(_fp4_task, ((family, layer, e0, e1, m),))
+                                    for e0, e1 in e_chunks]
+                    elif kind == "bf16":
+                        m_gu, m_dn = meta(keys[0]), meta(keys[1])
+                        results += [pool.apply_async(_bf16_expert_task, ((layer, e0, e1, m_gu, m_dn),))
+                                    for e0, e1 in e_chunks]
+                    elif kind == "dense":
+                        metas = {s: meta(layer_key(layer, s)) for s in DENSE_SUFFIXES}
+                        results += [pool.apply_async(_dense_task_v2, ((layer, names, metas),))
+                                    for names in DENSE_TASKS]
+                        written += _dense_task_v2((layer, VECTOR_NAMES, metas))
+                    elif kind == "global":
+                        results.append(pool.apply_async(_global_task, ((layer, meta(keys[0])),)))
+                    elif kind == "gs":
+                        gu_gs = read_meta(meta(keys[0])).astype(np.float32).reshape(cfg.experts, 2)
+                        dn_gs = read_meta(meta(keys[1])).astype(np.float32).reshape(cfg.experts)
+                        tiles = np.stack([expert_gs_tile(gu_gs[e, 0], gu_gs[e, 1], dn_gs[e])
+                                          for e in range(cfg.experts)])
+                        for rank in range(tp):
+                            written += _write_rank_array(rank, "expert_gs", layer, tiles)
+                written += sum(r.get() for r in results)
+                for fd in _SHARED.fds.values():
+                    os.fsync(fd)
+                if self_check:
+                    checked = []
+                    for uid in runnable:
+                        kind, layer, keys, *rest = units[uid]
+                        if kind == "fp4":
+                            bad = _fp4_self_check(cfg, tp, dst, doc, layer, rest[0], meta(keys[0]))
+                            if bad:
+                                raise RuntimeError(f"self-check failed: {bad}")
+                            checked.append(f"{layer}:{rest[0]}")
+                    if checked:
+                        log(f"fp4 self-check ok (expert 0, ranks 0/{tp - 1}): {' '.join(checked)}")
+                done.update(runnable)
+                written_total += written
+                progress["bytes_written"] += written
+                now = time.perf_counter()
+                dl_time, size = fetched.get(f, (0.0, 0))
+                progress["bytes_downloaded"] += size
+                shard_times.append(now - t0 + dl_time)
+                progress["elapsed"] += now - t0 + dl_time
+                save_progress()
+                with lock:
+                    for g in list(on_disk):
+                        if all(uid in done for uid in users.get(g, [])):
+                            source.release(g)
+                            del on_disk[g]
+                    lock.notify_all()
+                remaining = sum(source.size(g) for g in todo[i + 1:])
+                rate = progress["bytes_downloaded"] / max(progress["elapsed"], 1e-9)
+                log(f"shard {f} ({size / 1e9:.1f} GB, download {dl_time:.0f} s = "
+                    f"{size / max(dl_time, 1e-9) / 1e6:.0f} MB/s): {len(runnable)} units, "
+                    f"wrote {written / 1e9:.1f} GB in {now - t0:.0f} s; {i + 1}/{len(todo)} shards, "
+                    f"{len(done)}/{len(units)} units, {progress['bytes_written'] / 1e9:.0f}/"
+                    f"{total_bytes / 1e9:.0f} GB written, {len(on_disk)} shards on disk, "
+                    f"avg {rate / 1e6:.0f} MB/s, ETA {remaining / max(rate, 1e-9) / 60:.0f} min, "
+                    f"free {_free_bytes(dst) / 1e9:.0f} GB")
+    finally:
+        for fd in _SHARED.fds.values():
+            os.close(fd)
+        _SHARED.fds = {}
+    save_progress()
+    log(f"done: {len(done)}/{len(units)} units, complete={progress['complete']}, "
+        f"{progress['elapsed'] / 60:.1f} min total, {time.perf_counter() - started:.0f} s this run")
+    return progress
+
+
 # ---------------------------------------------------------------------------------------
 # Verification helpers and CLI
 # ---------------------------------------------------------------------------------------
@@ -1038,7 +1726,10 @@ def synthetic_presharded(tmpdir, cfg, tp, seed=0, **convert_kwargs):
 
 def verify_layer(src_dir, dst_dir, layer=0, experts=(0,), log=print):
     """Compare the container's layer against the checkpoint: dense spot checks (exact) and
-    the relative RMS error of the dequantized int4 experts. Returns a dict of numbers."""
+    the relative RMS error of the dequantized experts (int4 or nvfp4 container; `src_dir` may
+    be the bf16 checkpoint, whose dense tensors and layer-0/61 experts the NVFP4 repo shares,
+    so for a vendor-quantized layer the error is the vendor's own NVFP4 quantization error).
+    Returns a dict of numbers."""
     checkpoint = Checkpoint(src_dir)
     doc = read_layout(dst_dir)
     cfg, tp = config_from_layout(doc), doc["tp"]
@@ -1057,10 +1748,21 @@ def verify_layer(src_dir, dst_dir, layer=0, experts=(0,), log=print):
     results["q_row0_equals_q_proj_row0"] = bool(
         np.array_equal(row0.view(bits), q_proj[0].view(bits)))
 
+    fp4 = layout_expert_format(doc) == "nvfp4"
+
     def dequant(rank, kind, e):
-        q = read_rank_array(dst_dir, rank, kind + "_q", (layer, e), doc)
-        s = read_rank_array(dst_dir, rank, kind + "_s", (layer, e), doc)
-        return quant.dequantize_int4(q, s)
+        if not fp4:
+            q = read_rank_array(dst_dir, rank, kind + "_q", (layer, e), doc)
+            s = read_rank_array(dst_dir, rank, kind + "_s", (layer, e), doc)
+            return quant.dequantize_int4(q, s)
+        packed = read_rank_array(dst_dir, rank, kind + "_fp4", (layer, e), doc)
+        bs = read_rank_array(dst_dir, rank, kind + "_bs", (layer, e), doc)
+        gs = read_rank_array(dst_dir, rank, "expert_gs", (layer, e), doc)
+        if kind == "gate_up":
+            scale = np.concatenate([np.full(i_s, gs[0, 0]), np.full(i_s, gs[1, 0])])[None]
+        else:
+            scale = gs[2, 0]
+        return quant.dequant_fp4_np(packed, bs, scale.astype(np.float32))
 
     errors = []
     for e in experts:
@@ -1091,6 +1793,14 @@ def _cli(argv=None):
     conv.add_argument("--layers", type=str, default=None, help="e.g. '0' or '0,1,5'")
     conv.add_argument("--workers", type=int, default=None)
     conv.add_argument("--read-threads", type=int, default=READ_THREADS)
+    nv = sub.add_parser("convert-nvfp4", help="stream the NVFP4 Hub checkpoint into a v2 container")
+    nv.add_argument("--src", default=NVFP4_REPO, help="Hub repo id or a local checkpoint directory")
+    nv.add_argument("--dst", required=True)
+    nv.add_argument("--tp", type=int, default=8)
+    nv.add_argument("--workers", type=int, default=None)
+    nv.add_argument("--max-shards", type=int, default=3, help="shards kept on disk at once")
+    nv.add_argument("--shards", type=int, default=None, help="only the first n shards (tests)")
+    nv.add_argument("--min-free-gb", type=float, default=8.0)
     ver = sub.add_parser("verify", help="spot-check a converted layer against the checkpoint")
     ver.add_argument("--src", required=True)
     ver.add_argument("--dst", required=True)
@@ -1107,6 +1817,11 @@ def _cli(argv=None):
                                       layers=layers, workers=args.workers,
                                       read_threads=args.read_threads, log=log)
         return 0 if progress["layers"] else 1
+    if args.command == "convert-nvfp4":
+        progress = convert_presharded_nvfp4(
+            args.src, args.dst, tp=args.tp, workers=args.workers, max_shards=args.max_shards,
+            shards=args.shards, min_free_bytes=int(args.min_free_gb * 2**30), log=log)
+        return 0 if progress["complete"] else 1
     results = verify_layer(args.src, args.dst, args.layer,
                            [int(x) for x in args.experts.split(",")], log)
     print(json.dumps(results, indent=1))

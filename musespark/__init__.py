@@ -56,7 +56,13 @@ from jax import lax
 
 from musespark import layout, quant  # noqa: F401  (re-exported as musespark.quant)
 from musespark.config import MINI, Config
-from musespark.quant import dequantize_int4, quantize_int4, scales_from_chunked, scales_to_chunked
+from musespark.quant import (
+    dequant_fp4_jnp,
+    dequantize_int4,
+    quantize_int4,
+    scales_from_chunked,
+    scales_to_chunked,
+)
 
 __all__ = [
     "MINI",
@@ -113,6 +119,11 @@ LAYER_NAMES = (
     "gate_up_s",
     "down_q",
     "down_s",
+    "gate_up_fp4",
+    "gate_up_bs",
+    "down_fp4",
+    "down_bs",
+    "expert_gs",
 )
 
 
@@ -211,7 +222,20 @@ def layer_weights(weights, layer):
 
 
 def expert_weights(lw):
-    """(gate_up `[E, Hm, 2I]`, down `[E, I, Hm]`) bf16, dequantizing int4 experts on the fly."""
+    """(gate_up `[E, Hm, 2I]`, down `[E, I, Hm]`) bf16, dequantizing int4 experts on the fly.
+
+    NVFP4 entries (`gate_up_fp4 [E, Hm/8, 2I]` int32, `gate_up_bs [E, Hm/16, 2I]` e4m3,
+    `down_fp4`, `down_bs`, `expert_gs [E, 8, 128]` f32 with rows 0/1/2 = gate/up/down global
+    scale; see `musespark.quant` / `musespark.layout`) are dequantized exactly the same way.
+    """
+    if "gate_up_fp4" in lw:
+        gs = jnp.asarray(lw["expert_gs"], F32)  # [E, 8, 128]
+        two_i = lw["gate_up_fp4"].shape[-1]
+        col = jnp.arange(two_i, dtype=jnp.int32)[None, :] < two_i // 2
+        gu_gs = jnp.where(col, gs[:, 0:1, 0:1], gs[:, 1:2, 0:1])  # [E, 1, 2I]
+        gate_up = dequant_fp4_jnp(jnp.asarray(lw["gate_up_fp4"]), lw["gate_up_bs"], gu_gs)
+        down = dequant_fp4_jnp(jnp.asarray(lw["down_fp4"]), lw["down_bs"], gs[:, 2:3, 0:1])
+        return gate_up.astype(BF16), down.astype(BF16)
     if "gate_up_q" in lw:
         gate_up = dequantize_int4(jnp.asarray(lw["gate_up_q"]), lw["gate_up_s"]).astype(BF16)
         down = dequantize_int4(jnp.asarray(lw["down_q"]), lw["down_s"]).astype(BF16)
