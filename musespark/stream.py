@@ -1,17 +1,27 @@
 """Dense-weight bank ring and small vector helpers for the Muse Spark kernels (design.md 5.2).
 
 The ring streams every dense per-rank matrix of every layer through `BANKS` VMEM banks of
-`[bank_k, bank_n]` bf16 (`layout.tile_geometry(cfg)`: 1024 x 1024 = 2 MiB for the real
-model, `min(1024, H)` square for MINI) in the static order of `layout.tile_schedule(cfg)`:
+`[bank_k, bank_n]` (`layout.tile_geometry(cfg, dense_format)`: bf16 1024 x 1024 = 2 MiB for
+the real model, or int8 1024 x 2048 = the same 2 MiB with `dense_format="int8"`; `min(1024,
+H)`-sided for MINI) in the static order of `layout.tile_schedule(cfg, tp, dense_format)`:
 per layer q, kv, gate, o, pre, router_hi, router_lo, post (N-tiles outer, K-tiles inner
 inside each matrix), then the lm_head tiles after the last layer. Tiles narrower than the
 bank (kv/router `[1024, 256]`, pre `[1024, 512]`) are packed `pack = bank_n // bn`
 consecutive K-tiles per bank *load* (side by side in the bank's lanes, one DMA each) so that
 every ring slot carries a full 2 MiB and the in-flight bytes never drop below BANKS x 2 MiB
-(38 loads per layer for the real model). Global load `g` lives in bank `g % BANKS`, is
-fetched by `fetch(ring, g)` and consumed by `gemv`, which re-issues `g + BANKS` right after
-the dot so the ring always keeps BANKS loads (24 MiB) in flight, across layer boundaries and
-into the lm_head.
+(38 loads per layer for the real model in bf16, 21 in int8). Global load `g` lives in bank
+`g % BANKS`, is fetched by `fetch(ring, g)` and consumed by `gemv`, which re-issues
+`g + BANKS` right after the dot so the ring always keeps BANKS loads (24 MiB) in flight,
+across layer boundaries and into the lm_head.
+
+int8 dense format: the `INT8_DENSE` families and the lm_head are `[.., K, N]` int8 with one
+f32 scale per output column (`quant.quantize_int8`); their tiles are fed to the MXU as
+`jnp.dot(x_bf16, tile_int8) -> f32` directly (hw report section 3: int8 weights at the bf16
+push rate, never `.astype`) and `gemv(..., scale=s [1, N])` multiplies each N-block's f32
+column sums by its scales after the K sweep -- the maths of `dequantize_int8` up to f32
+summation order. The router hi/lo tiles stay bf16 and live in the int8 bank through its
+`.bitcast(bf16)` view (`[512, 2048]`: half the rows); in interpret mode (no ref bitcast) they
+get an exact-shape side bank instead (`bitcast=False`), like the narrow MINI tiles.
 
 Source windows are 2-D slices `w.at[layer, k0:k0+bk, n0:n0+bn]` of the plain `[L, K, N]`
 HBM arrays (strided DMAs run at full speed, hw report section 2). The identity of the tile
@@ -19,8 +29,8 @@ HBM arrays (strided DMAs run at full speed, hw report section 2). The identity o
 when the next layer does not exist), so no scalar division is needed on the hot path; the
 generic `fetch(ring, g)` with a traced `g` resolves the family with a `pl.when` chain.
 
-`gemv(ring, x [B, K] bf16, family, layer)` returns `f32 [B, N]` (or accumulates into an f32
-VMEM ref for wide N, e.g. the logits). Rows are padded/broadcast to 8 for the MXU.
+`gemv(ring, x [B, K] bf16, family, layer[, scale])` returns `f32 [B, N]` (or accumulates
+into an f32 VMEM ref for wide N, e.g. the logits). Rows are padded/broadcast to 8 for the MXU.
 """
 
 from dataclasses import dataclass
@@ -28,6 +38,7 @@ from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -38,6 +49,7 @@ from musespark.config import Config
 BANKS = layout.BANKS
 LM_HEAD = "lm_head"
 STATIC_N_BLOCKS = 8  # matrices with more N-tiles than this loop over N-blocks (lm_head)
+BF16 = jnp.bfloat16
 
 
 def _is_ref(x):
@@ -66,8 +78,9 @@ class Family:
     nb: int
     bk: int
     bn: int
-    narrow: int | None = None  # index of the exact-width bank array for bn % 128 != 0
+    narrow: int | None = None  # index of the exact-shape side bank (bn % 128 != 0, no bitcast)
     pack: int = 1  # K-tiles per bank load (lane window j holds tile li*pack + j)
+    dtype: object = BF16  # tile element type (int8 for the int8 dense families)
 
     @property
     def nkl(self):
@@ -93,32 +106,50 @@ class Family:
         return span(ki, self.nk, self.bk), span(ni, self.nb, self.bn)
 
 
-def narrow_tiles(cfg: Config, tp: int = 8):
-    """Distinct `(bk, bn)` of scheduled tiles narrower than 128 lanes (MINI only), sorted."""
-    sched = layout.tile_schedule(cfg, tp)
-    return sorted({(t.bk, t.bn) for t in sched.layer + sched.lm_head if t.bn % 128})
+def _side_key(tile, dtype):
+    return (tile.bk, tile.bn, np.dtype(dtype).name)
 
 
-def scratch_shapes(cfg: Config, tp: int = 8, banks: int = BANKS):
-    """`(VMEM banks [banks, bank_k, bank_n] bf16, DMA semaphores [banks], *narrow banks)`.
+def narrow_tiles(cfg: Config, tp: int = 8, dense_format="bf16", bitcast=True):
+    """Distinct `(bk, bn, dtype name)` of scheduled tiles that need an exact-shape side bank:
+    narrower than 128 lanes (MINI only) or, without `bitcast`, of a dtype other than the
+    bank's (bf16 router tiles in an int8 ring under the interpreter). Sorted."""
+    sched = layout.tile_schedule(cfg, tp, dense_format)
+    keys = set()
+    for t in sched.layer + sched.lm_head:
+        dtype = sched.dtype(t.family)
+        if t.bn % 128 or (not bitcast and np.dtype(dtype) != np.dtype(sched.geometry.dtype)):
+            keys.add(_side_key(t, dtype))
+    return sorted(keys)
+
+
+def scratch_shapes(cfg: Config, tp: int = 8, banks: int = BANKS, dense_format="bf16",
+                   bitcast=True):
+    """`(VMEM banks [banks, bank_k, bank_n] of the bank dtype, DMA semaphores [banks], *side
+    banks)`.
 
     Tiles narrower than 128 lanes cannot be DMA'd into a lane window of the main banks
-    (Mosaic requires tile-aligned slices), so each such `(bk, bn)` gets its own exact-width
-    `[banks, bk, bn]` bank array (`narrow_tiles`); none exist for the real model.
+    (Mosaic requires tile-aligned slices), so each such `(bk, bn, dtype)` gets its own
+    exact-shape `[banks, bk, bn]` bank array (`narrow_tiles`); none exist for the real model.
+    `bitcast=False` (interpret mode) also gives the bf16 tiles of an int8 ring a side bank.
     """
-    geo = layout.tile_geometry(cfg)
+    geo = layout.tile_geometry(cfg, dense_format)
     return (
         pltpu.VMEM((banks, geo.bank_k, geo.bank_n), geo.dtype),
         pltpu.SemaphoreType.DMA((banks,)),
-    ) + tuple(pltpu.VMEM((banks, bk, bn), geo.dtype) for bk, bn in narrow_tiles(cfg, tp))
+    ) + tuple(
+        pltpu.VMEM((banks, bk, bn), np.dtype(name))
+        for bk, bn, name in narrow_tiles(cfg, tp, dense_format, bitcast)
+    )
 
 
-def _pack(bk, bn, nk, geo, narrow):
-    """K-tiles per bank load: fill the bank's lanes with narrow tiles (never for exact-width
-    narrow banks, never across a partial bank row)."""
-    if narrow is not None or bk != geo.bank_k or geo.bank_n % bn:
+def _pack(bk, bn, nk, geo, narrow, dtype):
+    """K-tiles per bank load: fill the bank's lanes with narrow tiles (never for exact-shape
+    side banks, never across a partial bank row)."""
+    bank_k, bank_n = geo.tile_max(dtype)
+    if narrow is not None or bk != bank_k or bank_n % bn:
         return 1
-    return max(1, min(geo.bank_n // bn, nk))
+    return max(1, min(bank_n // bn, nk))
 
 
 def _families(sched: layout.Schedule, narrow):
@@ -132,10 +163,12 @@ def _families(sched: layout.Schedule, narrow):
         group = [t for t in tiles[i:] if t.family == name]
         group = group[: next((j for j, t in enumerate(group) if t.family != name), len(group))]
         bk, bn = group[0].bk, group[0].bn
+        dtype = sched.dtype(name)
         nk = len({t.k0 for t in group})
         nb = len({t.n0 for t in group})
-        pack = _pack(bk, bn, nk, sched.geometry, narrow.get((bk, bn)))
-        fam = Family(name, offset, nk, nb, bk, bn, narrow.get((bk, bn)), pack)
+        side = narrow.get(_side_key(group[0], dtype))
+        pack = _pack(bk, bn, nk, sched.geometry, side, dtype)
+        fam = Family(name, offset, nk, nb, bk, bn, side, pack, dtype)
         expect = [
             layout.Tile(name, ki * bk, ni * bn, bk, bn) for ni in range(nb) for ki in range(nk)
         ]
@@ -147,39 +180,54 @@ def _families(sched: layout.Schedule, narrow):
     return families
 
 
-def make_ring(cfg: Config, scratch, weights, lm_head=None, tp: int = 8):
+def make_ring(cfg: Config, scratch, weights, lm_head=None, tp: int = 8, dense_format="bf16",
+              bitcast=True, lag=0, blockdiag=True):
     """Bind the ring scratch and the HBM weight refs.
 
-    `scratch`: the refs allocated from `scratch_shapes(cfg)` (same order); `weights`: mapping
-    or namespace with an HBM ref `[L, K, N]` for every name in `layout.STREAMED_FAMILIES`;
-    `lm_head`: HBM ref `[H, Vp]` streamed after the last layer (None if the kernel does not
-    compute logits).
+    `scratch`: the refs allocated from `scratch_shapes(cfg, tp, banks, dense_format,
+    bitcast)` (same order); `weights`: mapping or namespace with an HBM ref `[L, K, N]` for
+    every name in `layout.STREAMED_FAMILIES` under its array name of `dense_format`
+    (`layout.dense_ref_name`: `q_i8` for `q` in int8); `lm_head`: HBM ref `[H, Vp]` (bf16, or
+    the int8 `lm_head_i8`) streamed after the last layer (None if the kernel does not compute
+    logits). `lag=1` issues the refill of a slot one load LATER but BEFORE the dot: consuming
+    load `g` first refills slot `g - 1` (already consumed), then computes; the DMA start no
+    longer waits for the matmul that reads slot `g`, at the price of one fewer load in
+    flight (`prime` issues `BANKS - lag` loads). `blockdiag` computes every packed load with
+    one block-diagonal dot (`_packed_dot`) instead of one dot per K-tile.
     """
-    sched = layout.tile_schedule(cfg, tp)
+    if lag not in (0, 1):
+        raise ValueError("lag must be 0 or 1")
+    sched = layout.tile_schedule(cfg, tp, dense_format)
     geo = sched.geometry
     banks, sems, *narrow_banks = scratch
-    narrow = {key: i for i, key in enumerate(narrow_tiles(cfg, tp))}
+    narrow = {key: i for i, key in enumerate(narrow_tiles(cfg, tp, dense_format, bitcast))}
     if tuple(banks.shape[1:]) != (geo.bank_k, geo.bank_n) or len(narrow_banks) != len(narrow):
         raise ValueError(f"ring scratch does not match scratch_shapes for {geo}")
+    if np.dtype(banks.dtype) != np.dtype(geo.dtype):
+        raise ValueError(f"ring banks are {banks.dtype}, the {dense_format} geometry needs {geo}")
     n_banks = banks.shape[0]  # the ring depth is whatever scratch_shapes allocated
     refs = {}
     for name in layout.STREAMED_FAMILIES:
-        ref = weights[name] if isinstance(weights, dict) else getattr(weights, name)
-        refs[name] = ref
+        array = layout.dense_ref_name(name, dense_format)
+        refs[name] = weights[array] if isinstance(weights, dict) else getattr(weights, array)
     families = _families(sched, narrow)
     for name, fam in families.items():
         L, K, N = refs[name].shape
         if (L, K, N) != (cfg.layers, fam.nk * fam.bk, fam.nb * fam.bn):
             raise ValueError(f"{name}: HBM ref {refs[name].shape} does not match the schedule")
+        if np.dtype(refs[name].dtype) != np.dtype(fam.dtype):
+            raise ValueError(f"{name}: HBM ref is {refs[name].dtype}, the schedule streams {fam.dtype}")
     lm = None
     if lm_head is not None:
         lm_tiles = sched.lm_head
         bk, bn = lm_tiles[0].bk, lm_tiles[0].bn
+        dtype = sched.dtype(LM_HEAD)
         nk, nb = len({t.k0 for t in lm_tiles}), len({t.n0 for t in lm_tiles})
-        pack = _pack(bk, bn, nk, geo, narrow.get((bk, bn)))
-        lm = Family(LM_HEAD, 0, nk, nb, bk, bn, narrow.get((bk, bn)), pack)
-        if tuple(lm_head.shape) != (nk * bk, nb * bn):
-            raise ValueError(f"lm_head {lm_head.shape} does not match the schedule")
+        side = narrow.get(_side_key(lm_tiles[0], dtype))
+        pack = _pack(bk, bn, nk, geo, side, dtype)
+        lm = Family(LM_HEAD, 0, nk, nb, bk, bn, side, pack, dtype)
+        if tuple(lm_head.shape) != (nk * bk, nb * bn) or np.dtype(lm_head.dtype) != np.dtype(dtype):
+            raise ValueError(f"lm_head {lm_head.shape} {lm_head.dtype} does not match the schedule")
     per = sum(f.loads for f in families.values())
     total = cfg.layers * per + (lm.loads if lm is not None else 0)
     return SimpleNamespace(
@@ -195,6 +243,10 @@ def make_ring(cfg: Config, scratch, weights, lm_head=None, tp: int = 8):
         total=total,
         banks_count=n_banks,
         deferred=[],
+        dtype=np.dtype(geo.dtype),
+        dense_format=dense_format,
+        lag=lag,
+        blockdiag=blockdiag,
     )
 
 
@@ -202,10 +254,57 @@ def make_ring(cfg: Config, scratch, weights, lm_head=None, tp: int = 8):
 # fetch
 # --------------------------------------------------------------------------------------
 def _bank_view(ring, fam: Family, bank, j=0):
-    """The `[bk, bn]` VMEM window of sub-tile `j` of a load of `fam` in slot `bank`."""
-    if fam.narrow is None:
+    """The `[bk, bn]` VMEM window of sub-tile `j` of a load of `fam` in slot `bank` (through
+    the bank's `.bitcast(fam.dtype)` view when the tile dtype differs from the bank's)."""
+    if fam.narrow is not None:
+        return ring.narrow_banks[fam.narrow].at[bank]
+    if np.dtype(fam.dtype) == ring.dtype:
         return ring.banks.at[bank, pl.ds(0, fam.bk), pl.ds(j * fam.bn, fam.bn)]
-    return ring.narrow_banks[fam.narrow].at[bank]
+    view = ring.banks.at[bank].bitcast(fam.dtype)
+    return view.at[pl.ds(0, fam.bk), pl.ds(j * fam.bn, fam.bn)]
+
+
+def _bank_window(ring, fam: Family, bank, n):
+    """The `[bk, n * bn]` VMEM window holding sub-tiles `0 .. n-1` of a load in slot `bank`."""
+    if fam.narrow is not None:
+        raise ValueError("side banks hold one tile per load")
+    base = ring.banks.at[bank]
+    if np.dtype(fam.dtype) != ring.dtype:
+        base = base.bitcast(fam.dtype)
+    return base.at[pl.ds(0, fam.bk), pl.ds(0, n * fam.bn)]
+
+
+def _stacked_lhs(lhs, fam: Family):
+    """`X [pack*rows, nkl*bk]` with `X[j*rows:(j+1)*rows, li*bk:(li+1)*bk] = lhs[:, K-tile
+    li*pack + j]` (zeros past the last K-tile): lane window `li` is the block-diagonal LHS of
+    load `li` (`_packed_dot`). Built once per gemv."""
+    rows, p, bk = lhs.shape[0], fam.pack, fam.bk
+    zeros = jnp.zeros((rows, bk), lhs.dtype)
+    blocks = []
+    for j in range(p):
+        pieces = []
+        for li in range(fam.nkl):
+            ki = li * p + j
+            pieces.append(lhs[:, ki * bk : (ki + 1) * bk] if ki < fam.nk else zeros)
+        blocks.append(jnp.concatenate(pieces, axis=1) if len(pieces) > 1 else pieces[0])
+    return jnp.concatenate(blocks, axis=0)
+
+
+def _packed_dot(ring, fam: Family, bank, x_bd, li, rows, n):
+    """One MXU op for the `n` K-tiles of packed load `li` (hw report section 3, the
+    block-diagonal LHS): the K-slices of x stacked as row blocks `X [pack*rows, bk]`
+    (`_stacked_lhs` lane window `li`) times the whole bank window `[bk, n*bn]`; the wanted
+    products are the diagonal `[rows, bn]` blocks of the result, the off-diagonal ones are
+    free (the MXU is weight-push bound). One wide dot replaces `n` narrow ones, whose issue
+    latency and int8 conversion dominated the stream at 2 MiB per load."""
+    x = x_bd[:, li * fam.bk : (li + 1) * fam.bk]
+    w = _bank_window(ring, fam, bank, n)[...]
+    r = jnp.dot(x, w, preferred_element_type=jnp.float32)  # [pack*rows, n*bn]
+    d = None
+    for j in range(n):
+        dj = r[j * rows : (j + 1) * rows, j * fam.bn : (j + 1) * fam.bn]
+        d = dj if d is None else d + dj
+    return d
 
 
 def _bank_copy(ring, src, fam: Family, bank, j=0):
@@ -350,14 +449,14 @@ def flush_deferred(ring):
 
 
 def prime(ring):
-    """Issue the first BANKS loads of the stream (call once before the layer loop)."""
-    for g in range(min(ring.banks_count, ring.total)):
+    """Issue the first BANKS (- lag) loads of the stream (call once before the layer loop)."""
+    for g in range(min(ring.banks_count - ring.lag, ring.total)):
         fetch(ring, g)
 
 
 def drain(ring, g_next):
-    """Wait for the loads `g_next .. g_next + BANKS` still in flight (static `g_next`)."""
-    for g in range(g_next, min(g_next + ring.banks_count, ring.total)):
+    """Wait for the loads `g_next .. g_next + BANKS - lag` still in flight (static `g_next`)."""
+    for g in range(g_next, min(g_next + ring.banks_count - ring.lag, ring.total)):
         if g < ring.layers * ring.per:
             j = g % ring.per
             fam = next(f for f in ring.families.values() if f.offset <= j < f.offset + f.loads)
@@ -380,8 +479,18 @@ def mxu_rows(x, rows=8):
     return x
 
 
+def _scale_block(scale, ni, bn, static):
+    """`[1, bn]` f32 column scales of N-block `ni` from `scale` (`[1, N]` value or VMEM ref)."""
+    if static:
+        return _value(scale)[:, ni * bn : (ni + 1) * bn].astype(jnp.float32)
+    if not _is_ref(scale):
+        raise ValueError("looped N-blocks need the scales as a VMEM ref")
+    return scale[:, pl.ds(pl.multiple_of(ni * bn, bn), bn)].astype(jnp.float32)
+
+
 def gemv(
-    ring, x, family, layer, *, out_f32=True, acc=None, g0=None, compute=True, defer_from=None
+    ring, x, family, layer, *, out_f32=True, acc=None, g0=None, compute=True, defer_from=None,
+    scale=None,
 ):
     """`x [B, K] bf16 @ W[family][layer]` streamed through the ring -> f32 `[B, N]`.
 
@@ -394,24 +503,28 @@ def gemv(
     back the refills whose target tile index is `>= defer_from` (including the next layer's
     tiles) until `flush_deferred(ring)`: used to let the expert slab DMAs of the layer enter
     the (FIFO) DMA queue ahead of the post / next-layer prefetch.
+    `scale` (`[1, N]` f32 value or VMEM ref; a ref for the lm_head) multiplies the f32 column
+    sums of each N-block after its K sweep: the int8 families' per-output-channel scales
+    (`quant.dequantize_int8` maths up to summation order).
     """
     x = _value(x)
     b = x.shape[0]
     lhs = mxu_rows(x.astype(jnp.bfloat16))
     nb_ = ring.banks_count
+    lag = ring.lag  # refill target of the load consumed now: `t + nb_ - lag`
     if family == LM_HEAD:
         fam = ring.lm
         if fam is None:
             raise ValueError("ring was built without an lm_head")
         base = ring.layers * ring.per
-        ahead = lambda t: _fetch_lm_index(ring, t + nb_)
-        ahead_dyn = lambda t: _fetch_lm_dynamic(ring, t + nb_)
+        ahead = lambda t: _fetch_lm_index(ring, t + nb_ - lag)
+        ahead_dyn = lambda t: _fetch_lm_dynamic(ring, t + nb_ - lag)
     else:
         fam = ring.families[family]
         base = layer * ring.per + fam.offset
 
         def ahead(t):
-            idx = fam.offset + t + nb_
+            idx = fam.offset + t + nb_ - lag
             if defer_from is not None and idx >= defer_from:
                 ring.deferred.append((layer, idx))
             else:
@@ -425,26 +538,42 @@ def gemv(
             f"{family}: x has {x.shape[1]} columns, the matrix has K={fam.nk * fam.bk}"
         )
 
+    packed = ring.blockdiag and fam.pack > 1 and compute
+    x_bd = _stacked_lhs(lhs, fam) if packed else None
+
     def k_sweep(ni, static):
         block = None
         for li in range(fam.nkl):
             t = ni * fam.nkl + li
             bank = (base + t) % nb_
             _wait_bank(ring, fam, bank, li)
-            for j, ki in fam.sub_tiles(li):
-                if compute:
+            if lag:  # refill the slot of the previous load before this load's dots
+                if static:
+                    ahead(t)
+                else:
+                    ahead_dyn(t)
+            subs = fam.sub_tiles(li)
+            if not compute:
+                d = jnp.zeros((lhs.shape[0], fam.bn), jnp.float32)
+            elif packed:
+                d = _packed_dot(ring, fam, bank, x_bd, li, lhs.shape[0], len(subs))
+            else:
+                d = None
+                for j, ki in subs:
                     tile = _bank_view(ring, fam, bank, j)[...]
-                    d = jnp.dot(
+                    dj = jnp.dot(
                         lhs[:, ki * fam.bk : (ki + 1) * fam.bk], tile,
                         preferred_element_type=jnp.float32,
                     )
+                    d = dj if d is None else d + dj
+            block = d if block is None else block + d
+            if not lag:
+                if static:
+                    ahead(t)
                 else:
-                    d = jnp.zeros((lhs.shape[0], fam.bn), jnp.float32)
-                block = d if block is None else block + d
-            if static:
-                ahead(t)
-            else:
-                ahead_dyn(t)
+                    ahead_dyn(t)
+        if scale is not None:
+            block = block * _scale_block(scale, ni, fam.bn, static)
         return block
 
     if fam.nb <= STATIC_N_BLOCKS:
