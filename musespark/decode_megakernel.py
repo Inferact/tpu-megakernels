@@ -50,8 +50,32 @@ Payload rows of the collectives are padded to 8 (`stream.mxu_rows`); payloads na
     "aux_hidden"       also return the f32 residual stream after the embedding and after every
                        layer as `[L + 1, B, H]` (replicated): `decode(...) -> (tokens, logits,
                        caches, aux)`
-    "moe_slots=N"      expert DMA slots (default: `default_moe_slots`, the largest of 4/3/2 that
-                       keeps the explicit VMEM total <= 58 MiB; one slot is 6.2 MiB at real widths)
+    "moe_slots=N"      expert DMA slots (default: `default_moe_slots`, the largest count <= 4
+                       that keeps the explicit VMEM total <= 58 MiB; one packed slot is 3.4 MiB
+                       at real widths; measured: 4 slots beat 3, 5, 6 and 8 at B=1 and B=8)
+    "banks=N"          dense ring depth in 2 MiB loads (default: `default_geometry`, 12 unless a
+                       shallower ring (>= 8; the depth is not measurable above 8) is needed to
+                       fit 8 expert slots)
+    "wire=bf16|f32"    payload dtype of the two per-layer all-reduces (default bf16: every
+                       rank's partial is rounded to bf16 before the fixed-order f32 summation
+                       and the reduced blocks travel as bf16 -- the result is r16'd by the
+                       caller anyway; f32 keeps the exact f32 partials on the wire at ~2x the
+                       collective time)
+    "flush=first|last" when the held-back refills are issued: after the first wave's body (the
+                       second wave's slabs are queued) or after the last wave's (default)
+    "kv_late"          issue the attention KV tile DMAs inside the attention phase (the
+                       original order) instead of at the start of the layer
+    "defer=none|next|post"
+                       which ring refills issued during the pre/router gemvs are held back
+                       until the expert slabs of the first two waves are in the (FIFO) DMA
+                       queue: none (original order; the default at B > 4, where the many
+                       expert waves need the ring tiles for DMA queue depth), next (the next
+                       layer's tiles; the default at B <= 4), post (also this layer's post tiles)
+    "skip=a,b,..."     PROFILING ONLY (wrong results): leave out phases to attribute time.
+                       `collectives` (all-reduce -> identity, all-gather -> local tile),
+                       `attention` (o := q, no cache traffic), `experts` (no expert DMAs/dots),
+                       `route` (static experts 0..K-1), `lm_head` (ring ends after the last
+                       layer, logits unwritten), `dense_dots` (ring DMAs only, no MXU work)
 
 Run TPU programs with `XLA_FLAGS=--xla_allow_excess_precision=false` so the glue's `r16`
 (`lax.reduce_precision`) and the reference agree bit for bit.
@@ -90,7 +114,10 @@ WEIGHT_NAMES = (
 # --------------------------------------------------------------------------------------
 def parse_options(options):
     """`frozenset` of option strings -> namespace (see the module docstring)."""
-    opts = SimpleNamespace(interpret=False, aux_hidden=False, moe_slots=None)
+    opts = SimpleNamespace(
+        interpret=False, aux_hidden=False, moe_slots=None, skip=frozenset(), wire=BF16,
+        kv_late=False, defer=None, banks=None, flush="last",
+    )
     for opt in options:
         if opt == "interpret":
             opts.interpret = True
@@ -98,9 +125,33 @@ def parse_options(options):
             opts.aux_hidden = True
         elif opt.startswith("moe_slots="):
             opts.moe_slots = int(opt.split("=", 1)[1])
+        elif opt == "kv_late":
+            opts.kv_late = True
+        elif opt.startswith("flush="):
+            opts.flush = opt.split("=", 1)[1]
+            if opts.flush not in ("first", "last"):
+                raise ValueError(f"unknown flush mode {opts.flush!r}")
+        elif opt.startswith("defer="):
+            opts.defer = opt.split("=", 1)[1]
+            if opts.defer not in ("none", "next", "post"):
+                raise ValueError(f"unknown defer mode {opts.defer!r}")
+        elif opt.startswith("banks="):
+            opts.banks = int(opt.split("=", 1)[1])
+        elif opt.startswith("wire="):
+            opts.wire = {"bf16": BF16, "f32": F32}[opt.split("=", 1)[1]]
+        elif opt.startswith("skip="):
+            skip = frozenset(x for x in opt.split("=", 1)[1].split(",") if x)
+            if skip - SKIPPABLE:
+                raise ValueError(f"unknown skip phases {sorted(skip - SKIPPABLE)}")
+            opts.skip = opts.skip | skip
         else:
             raise ValueError(f"unknown decode option {opt!r}")
     return opts
+
+
+SKIPPABLE = frozenset(
+    {"collectives", "attention", "experts", "route", "lm_head", "dense_dots"}
+)
 
 
 def _padded_bytes(shape, dtype):
@@ -147,7 +198,9 @@ def _collective_geometry(cfg: Config, batch, tp):
     return rows, width, max(cfg.moe_hidden // tp, cfg.hidden // tp)
 
 
-def scratch_shapes(cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=False):
+def scratch_shapes(
+    cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=False, wire=BF16, banks=layout.BANKS
+):
     """The kernel's scratch, grouped: `{group: tuple of pltpu.VMEM / semaphores}` in order."""
     rows, width, gather_width = _collective_geometry(cfg, batch, tp)
     hq, hkv, D = cfg.heads // tp, cfg.kv_heads // tp, cfg.head_dim
@@ -157,9 +210,10 @@ def scratch_shapes(cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=Fal
         (_, _, w), dtype = shapes[name]
         vectors += list(stream.vector_scratch(w, dtype))
     groups = {
-        "ring": stream.scratch_shapes(cfg, tp),
+        "ring": stream.scratch_shapes(cfg, tp, banks),
         "collectives": collectives.scratch_shapes(
-            rows, width, tp, gather_rows=8, gather_width=gather_width
+            rows, width, tp, gather_rows=8, gather_width=gather_width,
+            bf16_wire=wire == BF16, f32_wire=wire == F32,
         ),
         "attention": attention.scratch_shapes(cfg, batch, tp),
         "attention_io": (
@@ -182,16 +236,31 @@ def scratch_shapes(cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=Fal
 VMEM_EXPLICIT_LIMIT = 58 * MIB  # hw report: leave >= ~6 MiB for spills / internal scratch
 
 
-def default_moe_slots(cfg: Config, batch, tp=8, aux_hidden=False):
-    """Largest expert slot count in (4, 3, 2) whose explicit VMEM total fits `VMEM_EXPLICIT_LIMIT`
-    (real config: 4 for B <= 4, 3 at B = 8; MINI: always 4)."""
-    for slots in (moe.SLOTS, 3, 2):
-        if vmem_budget(cfg, batch, tp, slots, aux_hidden, log=None)["total"] <= VMEM_EXPLICIT_LIMIT:
+def default_moe_slots(cfg: Config, batch, tp=8, aux_hidden=False, wire=BF16, banks=layout.BANKS):
+    """Largest expert slot count `<= moe.SLOTS` (at least 2) whose explicit VMEM total fits
+    `VMEM_EXPLICIT_LIMIT` (real config with the packed slots: 4 for every B <= 8)."""
+    for slots in range(moe.SLOTS, 2, -1):
+        total = vmem_budget(cfg, batch, tp, slots, aux_hidden, log=None, wire=wire, banks=banks)
+        total = total["total"]
+        if total <= VMEM_EXPLICIT_LIMIT:
             return slots
     return 2
 
 
-def vmem_budget(cfg: Config, batch, tp=8, moe_slots=None, aux_hidden=False, log=print):
+def default_geometry(cfg: Config, batch, tp=8, aux_hidden=False, wire=BF16):
+    """`(moe_slots, banks)`: the deepest ring in (12, 10, 8) that still fits `moe.SLOTS` expert
+    slots, else 12 banks with as many slots as fit (`default_moe_slots`)."""
+    for banks in (layout.BANKS, 10, 8):
+        slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, banks)
+        if slots == moe.SLOTS:
+            return slots, banks
+    return default_moe_slots(cfg, batch, tp, aux_hidden, wire, layout.BANKS), layout.BANKS
+
+
+def vmem_budget(
+    cfg: Config, batch, tp=8, moe_slots=None, aux_hidden=False, log=print, wire=BF16,
+    banks=layout.BANKS,
+):
     """Explicit VMEM allocations of the kernel in bytes per group (+ `total`), printed via `log`.
 
     Counts the scratch groups of `scratch_shapes` (tile-padded, see `_padded_bytes`), the VMEM
@@ -199,8 +268,8 @@ def vmem_budget(cfg: Config, batch, tp=8, moe_slots=None, aux_hidden=False, log=
     compiler adds ~2.7 MiB of register spill slots on top (measured at real widths, B=8).
     """
     if moe_slots is None:
-        moe_slots = default_moe_slots(cfg, batch, tp, aux_hidden)
-    groups = scratch_shapes(cfg, batch, tp, moe_slots, aux_hidden)
+        moe_slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, banks)
+    groups = scratch_shapes(cfg, batch, tp, moe_slots, aux_hidden, wire, banks)
     out = {name: _scratch_bytes(shapes) for name, shapes in groups.items()}
     vp = layout.vocab_pad(cfg, tp)
     out["logits_acc"] = _padded_bytes((LOGIT_ROWS, vp), F32)
@@ -213,7 +282,7 @@ def vmem_budget(cfg: Config, batch, tp=8, moe_slots=None, aux_hidden=False, log=
     if log is not None:
         parts = ", ".join(f"{k} {v / MIB:.2f}" for k, v in out.items() if k != "total")
         log(
-            f"decode megakernel VMEM budget (B={batch}, moe_slots={moe_slots}): "
+            f"decode megakernel VMEM budget (B={batch}, moe_slots={moe_slots}, banks={banks}): "
             f"{out['total'] / MIB:.2f} MiB of {VMEM_LIMIT / MIB:.0f} [{parts}]"
         )
     return out
@@ -231,14 +300,14 @@ def _pad_rows(x, rows):
     return jnp.pad(x, ((0, rows - b), (0, 0)))
 
 
-def _all_reduce(x, ws, phase, tp):
+def _all_reduce(x, ws, phase, tp, wire=BF16):
     """`all_reduce_rows` of any `[R, W]` f32: rows padded to 8, `W < tp*128` folded into
     `tp*128`-wide rows (row group `i` in lanes `i*W:(i+1)*W`), result sliced back to `[R, W]`."""
     rows, width = x.shape
     unit = tp * 128
     if width % unit == 0:
         rp = -(-rows // 8) * 8
-        return collectives.all_reduce_rows(_pad_rows(x, rp), ws, phase)[:rows]
+        return collectives.all_reduce_rows(_pad_rows(x, rp), ws, phase, wire=wire)[:rows]
     if unit % width:
         raise ValueError(f"all-reduce width {width} must divide or be a multiple of {unit}")
     f = unit // width
@@ -246,7 +315,7 @@ def _all_reduce(x, ws, phase, tp):
     x = _pad_rows(x, rp)
     g = rp // f
     folded = jnp.concatenate([x[i * g : (i + 1) * g] for i in range(f)], axis=1)
-    y = collectives.all_reduce_rows(folded, ws, phase)
+    y = collectives.all_reduce_rows(folded, ws, phase, wire=wire)
     return jnp.concatenate([y[:, i * width : (i + 1) * width] for i in range(f)], axis=0)[:rows]
 
 
@@ -263,7 +332,7 @@ def _kernel_body(cfg: Config, batch, tp, opts):
     B = batch
     r16 = stream.r16
     n_weights = len(WEIGHT_NAMES)
-    groups = scratch_shapes(cfg, B, tp, opts.moe_slots, opts.aux_hidden)
+    groups = scratch_shapes(cfg, B, tp, opts.moe_slots, opts.aux_hidden, opts.wire, opts.banks)
     sizes = {name: len(shapes) for name, shapes in groups.items()}
 
     def body(pos_ref, x0_ref, rope_ref, final_norm_ref, *refs):
@@ -280,8 +349,25 @@ def _kernel_body(cfg: Config, batch, tp, opts):
             scratch[name], refs = refs[: sizes[name]], refs[sizes[name] :]
         assert not refs, len(refs)
 
-        ring = stream.make_ring(cfg, scratch["ring"], weights, weights["lm_head"], tp=tp)
-        ws = collectives.workspace(*scratch["collectives"])
+        skip = opts.skip
+        lm_head = None if "lm_head" in skip else weights["lm_head"]
+        ring = stream.make_ring(cfg, scratch["ring"], weights, lm_head, tp=tp)
+        ws = collectives.workspace(*scratch["collectives"], f32_wire=opts.wire == F32)
+        dots = "dense_dots" not in skip
+
+        def gemv(x, family, l, **kw):
+            return stream.gemv(ring, x, family, l, compute=dots, **kw)
+
+        def all_reduce(x, phase):
+            if "collectives" in skip:
+                return x
+            return _all_reduce(x, ws, phase, tp, opts.wire)
+
+        def all_gather(x, phase):
+            if "collectives" in skip:
+                return jnp.tile(r16(x), (1, tp))
+            return _all_gather_bf16(x, ws, phase)
+
         attn_ws = scratch["attention"]
         q_ref, kv_ref, g_ref = scratch["attention_io"]
         sc = moe.MoeScratch.bind(scratch["moe"])
@@ -333,36 +419,63 @@ def _kernel_body(cfg: Config, batch, tp, opts):
                 prefetch_vectors(l + 1)
 
             # -- attention ------------------------------------------------------------------
-            q_ref[...] = r16(stream.gemv(ring, x_ref, "q", l))
-            kv_ref[...] = r16(stream.gemv(ring, x_ref, "kv", l))
-            g_ref[...] = r16(stream.gemv(ring, x_ref, "gate", l))
-            o = attention.attention_layer(
-                cfg, B, l, pos_ref, q_ref, kv_ref, g_ref, rope_ref, k_cache, v_cache, attn_ws,
-                tp=tp, wait_writes=False,
-            )
-            partial_o = stream.gemv(ring, o, "o", l)  # [B, H] f32 partial sums
-            attention.wait_cache_writes(cfg, B, l, pos_ref, k_cache, v_cache, attn_ws)
-            attn_out = r16(_all_reduce(partial_o, ws, phase, tp))
+            kv_early = "attention" not in skip and not opts.kv_late
+            if kv_early:  # KV tiles ahead of this layer's dense refills in the DMA queue
+                attention.prefetch_kv(cfg, B, l, pos_ref, k_cache, v_cache, attn_ws)
+            q_ref[...] = r16(gemv(x_ref, "q", l))
+            kv_ref[...] = r16(gemv(x_ref, "kv", l))
+            g_ref[...] = r16(gemv(x_ref, "gate", l))
+            if "attention" in skip:
+                o = q_ref[...]
+            else:
+                o = attention.attention_layer(
+                    cfg, B, l, pos_ref, q_ref, kv_ref, g_ref, rope_ref, k_cache, v_cache,
+                    attn_ws, tp=tp, wait_writes=False, primed=kv_early,
+                )
+            partial_o = gemv(o, "o", l)  # [B, H] f32 partial sums
+            if "attention" not in skip:
+                attention.wait_cache_writes(cfg, B, l, pos_ref, k_cache, v_cache, attn_ws)
+            attn_out = r16(all_reduce(partial_o, phase))
             # -- post-attention boundary ----------------------------------------------------
             nb = r16(stream.rms(attn_out, None, cfg.post_eps))
             s = stream.gated_residual(s_ref, nb, v("attn_gate_alpha", l), v("attn_gate_beta", l))
             s_ref[...] = s
             x_ffn = stream.norm_to_bf16(s, v("ffn_norm", l), cfg.rms_eps)  # [B, H] bf16
             # -- MoE ------------------------------------------------------------------------
-            h0 = stream.gemv(ring, x_ffn, "pre", l)  # [B, Hm/tp] f32
-            logits = stream.gemv(ring, x_ffn, "router_hi", l) + stream.gemv(
-                ring, x_ffn, "router_lo", l
+            # Refills targeting the post / next-layer tiles are held back until the expert
+            # slabs of the first two waves are in the (FIFO) DMA queue.
+            defer = {"none": None, "post": stream.post_offset(ring), "next": ring.per}[opts.defer]
+            h0 = gemv(x_ffn, "pre", l, defer_from=defer)  # [B, Hm/tp] f32
+            logits = gemv(x_ffn, "router_hi", l, defer_from=defer) + gemv(
+                x_ffn, "router_lo", l, defer_from=defer
             )
-            idx, w = moe.route_from_logits(cfg, logits, v("router_bias", l))
+            if "route" in skip:
+                lane = lax.broadcasted_iota(I32, (B, moe.LANES), 1)
+                idx = jnp.where(lane < cfg.top_k, lane, cfg.experts)
+                w = jnp.where(lane < cfg.top_k, F32(1.0 / cfg.top_k), F32(0)) + logits[:, :1] * 0
+            else:
+                idx, w = moe.route_from_logits(cfg, logits, v("router_bias", l))
             moe.route_to_scratch(cfg, sc, idx, w)
-            moe.start_expert_stream(cfg, l, experts, sc)
-            h0 = _all_gather_bf16(r16(h0), ws, phase + 1)  # [B, Hm]
+            if "experts" not in skip:
+                moe.start_expert_stream(cfg, l, experts, sc)
+            h0 = all_gather(r16(h0), phase + 1)  # [B, Hm]
             h1 = stream.norm_to_bf16(h0, v("pre_expert_norm", l), cfg.rms_eps)
-            moe.expert_stream(cfg, l, h1, experts, sc, started=True)
-            Y = _all_reduce(sc.y_out[...], ws, phase + 2, tp)  # [K*B, Hm]
+            if "experts" not in skip:
+
+                def after_wave(w, n_waves):
+                    @pl.when(w == (0 if opts.flush == "first" else n_waves - 1))
+                    def _flush():
+                        stream.flush_deferred(ring)
+
+                moe.expert_stream(cfg, l, h1, experts, sc, started=True, after_wave=after_wave)
+                assert not ring.deferred  # flushed inside the wave loop (>= 1 wave per layer)
+            else:
+                sc.y_out[...] = jnp.broadcast_to(h1[:1].astype(F32), sc.y_out.shape) * 0.01
+                stream.flush_deferred(ring)
+            Y = all_reduce(sc.y_out[...], phase + 2)  # [K*B, Hm]
             m = moe.finalize(cfg, Y, sc.w, v("post_expert_norm", l), B)  # [B, Hm]
-            out = stream.gemv(ring, m, "post", l)  # [B, H/tp] f32
-            ffn_out = _all_gather_bf16(r16(out), ws, phase + 3)  # [B, H]
+            out = gemv(m, "post", l)  # [B, H/tp] f32
+            ffn_out = all_gather(r16(out), phase + 3)  # [B, H]
             # -- post-FFN boundary ----------------------------------------------------------
             t = r16(ffn_out * v("post_ffn_norm", l).astype(F32))
             nb = r16(t * lax.rsqrt(jnp.mean(t * t, axis=-1, keepdims=True) + cfg.post_eps))
@@ -381,7 +494,10 @@ def _kernel_body(cfg: Config, batch, tp, opts):
 
         # ---- final norm + lm_head ---------------------------------------------------------
         hN = stream.norm_to_bf16(r16(s_ref[...]), final_norm_ref[...], cfg.rms_eps)
-        stream.gemv(ring, hN, "lm_head", L, acc=logits_ref)
+        if "lm_head" in skip:
+            logits_ref[:, pl.ds(0, H)] = jnp.broadcast_to(hN.astype(F32)[:1], (LOGIT_ROWS, H))
+        else:
+            gemv(hN, "lm_head", L, acc=logits_ref)
 
     return body, groups
 
@@ -392,8 +508,14 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
     per-rank dict without the leading rank axis). Used by `make_decode`."""
     opts = parse_options(options)
     layout.check_tp(cfg, tp)
-    if opts.moe_slots is None:
-        opts.moe_slots = default_moe_slots(cfg, batch, tp, opts.aux_hidden)
+    if opts.moe_slots is None and opts.banks is None:
+        opts.moe_slots, opts.banks = default_geometry(cfg, batch, tp, opts.aux_hidden, opts.wire)
+    elif opts.banks is None:
+        opts.banks = layout.BANKS
+    elif opts.moe_slots is None:
+        opts.moe_slots = default_moe_slots(cfg, batch, tp, opts.aux_hidden, opts.wire, opts.banks)
+    if opts.defer is None:
+        opts.defer = "next" if batch <= 4 else "none"
     if context % attention.TOKENS:
         raise ValueError(f"context must be a multiple of {attention.TOKENS}")
     if not 1 <= batch <= moe.MR:
@@ -456,7 +578,7 @@ def make_decode(
     return_logits = return_logits or not greedy
     kernel, opts = make_kernel(cfg, context, batch, tp=tp, options=options)
     vp = layout.vocab_pad(cfg, tp)
-    vmem_budget(cfg, batch, tp, opts.moe_slots, opts.aux_hidden)
+    vmem_budget(cfg, batch, tp, opts.moe_slots, opts.aux_hidden, wire=opts.wire, banks=opts.banks)
 
     def local(weights, caches, tokens, pos):
         w = {name: value[0] for name, value in weights.items()}

@@ -11,8 +11,13 @@ Per-rank expert layout (TP8 inside every expert, `Is = I / tp`, `KC = quant.k_ch
     down_q    [L, E, Is, Hm]               int4
     down_s    [L, E, Is/KC', KC'/G, Hm]    f32
 
-The int4 slabs are DMA'd as int4 into VMEM slots and fed straight to the MXU
-(`jnp.dot(bf16, int4)`); group scales are applied with the block-diagonal-LHS trick:
+The int4 slabs are DMA'd as *packed int8 bytes* (the HBM int4 ref viewed with
+`.bitcast(int8)`: byte `m` holds rows `2m` (low nibble) and `2m + 1` (high nibble), a pure
+reinterpretation) into `[K/2, N]` int8 VMEM slots -- Mosaic allocates one byte per int4
+element in VMEM, so this halves the slot footprint (3.1 MiB per expert at real widths) --
+and the slot's `.bitcast(int4)` view `[K, N]` is fed straight to the MXU (`jnp.dot(bf16,
+int4)`, bit-identical to the native int4 path, measured); group scales are applied with the
+block-diagonal-LHS trick:
 `block_diag(x)` expands the `[MR, K]` bf16 input into `[K/KC, GPC*MR, KC]` (chunk `i` holds the
 block-diagonal `[(g, m), k]` = `x[m, k]` if `k` is in group `g` of that chunk, else 0), so one
 `[GPC*MR, KC] x [KC, N]` dot yields every group's partial product as a separate row block and
@@ -27,7 +32,7 @@ holds route slot `k`; other lanes hold the sentinel `E` / weight 0) because the 
 runtime loop. In scratch the tiles are `[MR, 128]` with rows `>= B` set to the sentinel.
 
 Expert stream: each DISTINCT expert of the batch is processed exactly once, in ascending
-expert id (min-pending-id stream over the route tile), in waves of `SLOTS = 4` experts whose
+expert id (min-pending-id stream over the route tile), in waves of `SLOTS` experts whose
 DMAs are issued as early as possible (the first wave right after routing, each slot refilled
 as soon as its expert's dots have been issued). Per expert
 `gu = int4_group_dot(h1_bd, gate_up)`, `a = r16(silu(gu[:, :Is]) * gu[:, Is:])`,
@@ -60,7 +65,9 @@ I32 = jnp.int32
 
 MR = 8  # row block of every MXU LHS (the decode batch is padded to this many rows)
 LANES = 128  # lane-dense bookkeeping tiles are [MR, LANES]
-SLOTS = 4  # int4 expert slots (2 in compute, 2 in flight)
+SLOTS = 4  # expert slots: 2 in compute, 2 in flight (measured optimum; 5-8 slots are slower)
+PACK = 2  # int4 rows per int8 byte of a slot
+COMPACT_WAVES = True  # 2 wave-body variants (full / partial) instead of 4 (code size)
 COPIES = 4  # DMAs per expert: gate_up_q, gate_up_s, down_q, down_s
 
 
@@ -194,9 +201,9 @@ def int4_group_dot(x_bd, w_ref, s_ref, rows=MR):
 class MoeScratch:
     """VMEM/semaphore scratch of the MoE mini-kernel (see `scratch_shapes`)."""
 
-    gate_up_q: object  # [SLOTS, Hm, 2*Is] int4
+    gate_up_q: object  # [SLOTS, Hm/2, 2*Is] int8 (packed int4 rows; `.bitcast(int4)` -> [Hm, 2*Is])
     gate_up_s: object  # [SLOTS, Hm/KC, KC/G, 2*Is] f32
-    down_q: object  # [SLOTS, Is, Hm] int4
+    down_q: object  # [SLOTS, Is/2, Hm] int8 (packed int4 rows)
     down_s: object  # [SLOTS, Is/KC', KC'/G, Hm] f32
     h_pad: object  # [MR, Hm] f32: h1 padded to MR rows
     h_bd: object  # [Hm/KC, GPC*MR, KC] bf16: block-diagonal expansion of h_pad
@@ -213,8 +220,8 @@ class MoeScratch:
 
 
 def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
-    """Scratch tuple for `MoeScratch.bind` (real config: 12 MiB slots + 0.75 MiB scales +
-    0.4 MiB block-diagonal/padding buffers + 1 MiB y_out for B=8)."""
+    """Scratch tuple for `MoeScratch.bind` (real config: 3 MiB per slot + 0.2 MiB scales per
+    slot + 0.4 MiB block-diagonal/padding buffers + 1 MiB y_out for B=8)."""
     if batch > MR:
         raise ValueError(f"batch {batch} exceeds the MXU row block {MR}")
     if cfg.top_k > LANES:
@@ -222,10 +229,12 @@ def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
     Hm, G = cfg.moe_hidden, cfg.group_size
     Is = cfg.expert_hidden // tp
     kc_gu, kc_dn = k_chunk(Hm), k_chunk(Is)
+    if Hm % (32 * PACK) or Is % (32 * PACK):
+        raise ValueError("packed int4 slots need K multiples of 64 rows")
     return (
-        pltpu.VMEM((slots, Hm, 2 * Is), jnp.int4),
+        pltpu.VMEM((slots, Hm // PACK, 2 * Is), jnp.int8),
         pltpu.VMEM((slots, Hm // kc_gu, kc_gu // G, 2 * Is), F32),
-        pltpu.VMEM((slots, Is, Hm), jnp.int4),
+        pltpu.VMEM((slots, Is // PACK, Hm), jnp.int8),
         pltpu.VMEM((slots, Is // kc_dn, kc_dn // G, Hm), F32),
         pltpu.VMEM((MR, Hm), F32),
         pltpu.VMEM(block_diag_shape(Hm, G), BF16),
@@ -239,7 +248,7 @@ def scratch_shapes(cfg: Config, batch, tp=8, slots=SLOTS):
 
 
 def scratch_bytes(cfg: Config, batch, tp=8, slots=SLOTS):
-    """VMEM bytes of `scratch_shapes` (int4 counted at 4 bits)."""
+    """VMEM bytes of `scratch_shapes` (the packed slots at one byte per two int4 values)."""
     total = 0
     for s in scratch_shapes(cfg, batch, tp, slots)[:-2]:
         n = 1
@@ -267,13 +276,15 @@ class ExpertWeights:
 def _expert_copies(weights: ExpertWeights, sc: MoeScratch, layer, expert, slot):
     return SimpleNamespace(
         gate_up_q=pltpu.make_async_copy(
-            weights.gate_up_q.at[layer, expert], sc.gate_up_q.at[slot], sc.sems.at[slot, 0]
+            weights.gate_up_q.at[layer, expert].bitcast(jnp.int8),
+            sc.gate_up_q.at[slot],
+            sc.sems.at[slot, 0],
         ),
         gate_up_s=pltpu.make_async_copy(
             weights.gate_up_s.at[layer, expert], sc.gate_up_s.at[slot], sc.sems.at[slot, 1]
         ),
         down_q=pltpu.make_async_copy(
-            weights.down_q.at[layer, expert], sc.down_q.at[slot], sc.sems.at[slot, 2]
+            weights.down_q.at[layer, expert].bitcast(jnp.int8), sc.down_q.at[slot], sc.sems.at[slot, 2]
         ),
         down_s=pltpu.make_async_copy(
             weights.down_s.at[layer, expert], sc.down_s.at[slot], sc.sems.at[slot, 3]
@@ -365,17 +376,21 @@ def _store_rows(sc: MoeScratch, y, consumed, batch, K):
         pltpu.store(sc.y_out.at[pl.ds(k * B, B), :], y, mask=mask)
 
 
-def expert_stream(cfg: Config, layer, h1, weights: ExpertWeights, sc: MoeScratch, started=False):
+def expert_stream(
+    cfg: Config, layer, h1, weights: ExpertWeights, sc: MoeScratch, started=False, after_wave=None
+):
     """Run every distinct expert of the batch once; fills `sc.y_out` (see the module docstring).
 
     `h1 [B, Hm]` (bf16-valued f32 or bf16): pre_expert_norm output, identical on every rank.
     `sc.idx` must hold the route tile (`route_to_scratch`). With `started=True` the first
-    wave's DMAs were already issued by `start_expert_stream`.
+    wave's DMAs were already issued by `start_expert_stream`. `after_wave(w, n_waves)`
+    (optional) is traced at the end of every wave body, i.e. after the DMAs of wave `w + 1`
+    were issued (`n_waves` is the traced wave count).
     """
     B, Hm = h1.shape
     K, E, G = cfg.top_k, cfg.experts, cfg.group_size
     slots = sc.gate_up_q.shape[0]
-    Is = sc.down_q.shape[1]
+    Is = sc.down_q.shape[1] * PACK  # packed int8 rows -> int4 rows
     kc_dn = k_chunk(Is)
 
     if not started:
@@ -395,12 +410,14 @@ def expert_stream(cfg: Config, layer, h1, weights: ExpertWeights, sc: MoeScratch
 
     def gate_up(slot):
         _wait(_expert_copies(weights, sc, layer, 0, slot))
-        return int4_group_dot(sc.h_bd, sc.gate_up_q.at[slot], sc.gate_up_s.at[slot])
+        w = sc.gate_up_q.at[slot].bitcast(jnp.int4)  # [Hm, 2*Is]
+        return int4_group_dot(sc.h_bd, w, sc.gate_up_s.at[slot])
 
     def finish(slot, gu, consumed):
         gate, up = gu[:, :Is], gu[:, Is:]
         a = r16(gate * jax.nn.sigmoid(gate) * up)
-        y = int4_group_dot(block_diag_values(a, G, kc_dn), sc.down_q.at[slot], sc.down_s.at[slot])
+        w = sc.down_q.at[slot].bitcast(jnp.int4)  # [Is, Hm]
+        y = int4_group_dot(block_diag_values(a, G, kc_dn), w, sc.down_s.at[slot])
         _store_rows(sc, y, consumed, B, K)
 
     def wave_body(cur, nxt, refill, select_ahead=None):
@@ -449,34 +466,52 @@ def expert_stream(cfg: Config, layer, h1, weights: ExpertWeights, sc: MoeScratch
         next_full = nxt[-1].has
         next_any = nxt[0].has
 
-        # Steady state: the next wave is full, refills are unconditional (one basic block).
-        @pl.when(full & next_full)
-        def _steady():
-            wave_body(cur, nxt, "always", select_ahead)
+        if COMPACT_WAVES:
+            # Two variants: a full wave (per-slot conditional refills, still one MXU chain)
+            # and the partial last wave.
+            @pl.when(full)
+            def _full():
+                wave_body(cur, nxt, "cond", select_ahead)
 
-        # Full wave before a partial one: per-slot conditional refills.
-        @pl.when(full & next_any & ~next_full)
-        def _before_tail():
-            wave_body(cur, nxt, "cond")
+            @pl.when(~full)
+            def _tail():
+                for s in range(slots):
 
-        # Last full wave: nothing to refill.
-        @pl.when(full & ~next_any)
-        def _last_full():
-            wave_body(cur, nxt, "never")
+                    @pl.when(cur[s].has)
+                    def _one(s=s):
+                        finish(s, gate_up(s), cur[s].consumed)
 
-        # Partial last wave.
-        @pl.when(~full)
-        def _tail():
-            for s in range(slots):
+        else:
+            # Steady state: the next wave is full, refills are unconditional (one basic block).
+            @pl.when(full & next_full)
+            def _steady():
+                wave_body(cur, nxt, "always", select_ahead)
 
-                @pl.when(cur[s].has)
-                def _one(s=s):
-                    finish(s, gate_up(s), cur[s].consumed)
+            # Full wave before a partial one: per-slot conditional refills.
+            @pl.when(full & next_any & ~next_full)
+            def _before_tail():
+                wave_body(cur, nxt, "cond")
+
+            # Last full wave: nothing to refill.
+            @pl.when(full & ~next_any)
+            def _last_full():
+                wave_body(cur, nxt, "never")
+
+            # Partial last wave.
+            @pl.when(~full)
+            def _tail():
+                for s in range(slots):
+
+                    @pl.when(cur[s].has)
+                    def _one(s=s):
+                        finish(s, gate_up(s), cur[s].consumed)
 
         consumed = cur[0].consumed
         for p in cur[1:]:
             consumed = consumed | p.consumed
         sc.done[...] = jnp.where(consumed, I32(1), sc.done[...])
+        if after_wave is not None:
+            after_wave(w, n_waves)
 
 
 # ---------------------------------------------------------------------------------------------

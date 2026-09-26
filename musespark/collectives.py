@@ -127,13 +127,16 @@ def wire_rows(rows, width, tp=TP, row_tile=8):
     return _wire(rows, width // tp, row_tile).fr
 
 
-def scratch_shapes(rows, width=8192, tp=TP, gather_rows=8, gather_width=None, bf16_wire=False):
+def scratch_shapes(
+    rows, width=8192, tp=TP, gather_rows=8, gather_width=None, bf16_wire=False, f32_wire=True
+):
     """Scratch for the collectives, in the order `workspace()` consumes it.
 
     `rows x width` is the largest all-reduce payload (`[64, 4096]` for the expert outputs at
     B=8 also covers `[8, 8192]`); `gather_rows x gather_width` the largest all-gather shard
-    (default `[8, width // tp]`). Sizes for (64, 4096): 1 + 2 + 2 + 0.25 + 0.25 MiB, plus
-    half of that again with `bf16_wire` (the bf16-payload all-reduce buffers).
+    (default `[8, width // tp]`). Sizes for (64, 4096): 1 + 2 + 2 + 0.25 + 0.25 MiB with the
+    f32 wire, plus / or half of that with `bf16_wire` (the bf16-payload all-reduce buffers;
+    `f32_wire=False` drops the f32 ones, then only `wire=jnp.bfloat16` reductions are legal).
     """
     if gather_width is None:
         gather_width = width // tp
@@ -142,10 +145,14 @@ def scratch_shapes(rows, width=8192, tp=TP, gather_rows=8, gather_width=None, bf
     gr, gl = max(8, gw.fr), max(128, gw.fl)
     gw16 = _wire(gather_rows, gather_width, 16)
     gr16, gl16 = max(16, gw16.fr), max(128, gw16.fl)
-    shapes = (
-        pltpu.VMEM((tp, wr, WIRE_LANES), jnp.float32),  # send: my column blocks, block-major
-        pltpu.VMEM((2, tp, wr, WIRE_LANES), jnp.float32),  # rs_recv[slot, source rank]
-        pltpu.VMEM((2, tp, wr, WIRE_LANES), jnp.float32),  # ag_recv[slot, owner rank]
+    shapes = ()
+    if f32_wire:
+        shapes += (
+            pltpu.VMEM((tp, wr, WIRE_LANES), jnp.float32),  # send: my column blocks, block-major
+            pltpu.VMEM((2, tp, wr, WIRE_LANES), jnp.float32),  # rs_recv[slot, source rank]
+            pltpu.VMEM((2, tp, wr, WIRE_LANES), jnp.float32),  # ag_recv[slot, owner rank]
+        )
+    shapes += (
         pltpu.VMEM((2, tp, gr, gl), jnp.float32),  # g_recv_f32[slot, owner rank]
         pltpu.VMEM((2, tp, gr16, gl16), jnp.bfloat16),  # g_recv_bf16
         pltpu.SemaphoreType.DMA((2, tp - 1)),  # rs_send
@@ -165,10 +172,8 @@ def scratch_shapes(rows, width=8192, tp=TP, gather_rows=8, gather_width=None, bf
     return shapes
 
 
+_WS_NAMES32 = ("send", "rs_recv", "ag_recv")
 _WS_NAMES = (
-    "send",
-    "rs_recv",
-    "ag_recv",
     "g_recv_f32",
     "g_recv_bf16",
     "rs_send_sems",
@@ -181,17 +186,22 @@ _WS_NAMES = (
 _WS_NAMES16 = ("send16", "rs_recv16", "ag_recv16")
 
 
-def workspace(*refs):
-    """Bind the refs allocated from `scratch_shapes` (same order) into a namespace."""
-    names = _WS_NAMES + (_WS_NAMES16 if len(refs) > len(_WS_NAMES) else ())
-    if len(refs) != len(names):
+def workspace(*refs, f32_wire=True):
+    """Bind the refs allocated from `scratch_shapes(..., f32_wire=f32_wire)` (same order) into a
+    namespace; whether the bf16 wire buffers are present is inferred from the count."""
+    names = (_WS_NAMES32 if f32_wire else ()) + _WS_NAMES
+    if len(refs) == len(names) + len(_WS_NAMES16):
+        names += _WS_NAMES16
+    elif len(refs) != len(names):
         raise ValueError(
-            f"workspace expects {len(_WS_NAMES)} or {len(names)} refs, got {len(refs)}"
+            f"workspace expects {len(names)} or {len(names) + len(_WS_NAMES16)} refs, "
+            f"got {len(refs)}"
         )
     ws = SimpleNamespace(**dict(zip(names, refs)))
-    if len(refs) == len(_WS_NAMES):
-        ws.send16 = ws.rs_recv16 = ws.ag_recv16 = None
-    ws.tp = ws.rs_recv.shape[1]
+    for name in _WS_NAMES32 + _WS_NAMES16:
+        if not hasattr(ws, name):
+            setattr(ws, name, None)
+    ws.tp = ws.g_recv_f32.shape[1]
     return ws
 
 
@@ -256,6 +266,8 @@ def all_reduce_rows(x, ws, phase, wire=jnp.float32):
         send, rs_recv, ag_recv, row_tile = ws.send16, ws.rs_recv16, ws.ag_recv16, 16
         x = x.astype(jnp.bfloat16)
     else:
+        if ws.send is None:
+            raise ValueError("f32 wire needs scratch_shapes(..., f32_wire=True)")
         send, rs_recv, ag_recv, row_tile = ws.send, ws.rs_recv, ws.ag_recv, 8
     w = _wire(rows, wb, row_tile)
     if w.fr > send.shape[1] or w.fl > send.shape[2]:

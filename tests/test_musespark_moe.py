@@ -408,8 +408,8 @@ def test_route_matches_package_reference(batch):
 
 
 def test_scratch_budget():
-    real = moe.scratch_bytes(Config(), 8, TP)
-    assert real <= 20 << 20, real / 2**20
+    real = moe.scratch_bytes(Config(), 8, TP)  # 8 packed slots x 3.1 MiB + scales + buffers
+    assert real <= 28 << 20, real / 2**20
     assert moe.scratch_bytes(MINI, 8, TP) < 1 << 20
 
 

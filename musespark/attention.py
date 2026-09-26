@@ -184,6 +184,46 @@ def _write_copy(stage, cache, sem, layer, row, block):
     return pltpu.make_async_copy(stage.at[row], cache.at[layer, row, pl.ds(start, TOKENS), :], sem)
 
 
+def _block_plan(cfg: Config, batch, layer, pos_ref):
+    """Per-row scalars: `(pos, lo, first block, last block, block count, max count)`."""
+    layer = jnp.asarray(layer, jnp.int32)
+    is_full = (layer % cfg.full_attention_every) == cfg.full_attention_offset
+    not_full = 1 - is_full.astype(jnp.int32)
+    pos = [pos_ref[b] for b in range(batch)]
+    lo = [jnp.maximum(p - (cfg.sliding_window - 1), 0) * not_full for p in pos]
+    first = [x // TOKENS for x in lo]
+    last = [p // TOKENS for p in pos]
+    count = [la - fi + 1 for fi, la in zip(first, last)]
+    nsteps = functools.reduce(jnp.maximum, count)
+    return pos, lo, first, last, count, nsteps
+
+
+def _issue_tiles(batch, layer, first, last, k_cache, v_cache, ws, j, slot):
+    """Start the K and V tile DMAs of block step `j` of every row into `slot`."""
+    for b in range(batch):
+        blk = jnp.minimum(first[b] + j, last[b])  # rows past their last block re-read it
+        _tile_copy(k_cache, ws.kbuf, ws.ksem, layer, b, blk, slot).start()
+        _tile_copy(v_cache, ws.vbuf, ws.vsem, layer, b, blk, slot).start()
+
+
+def _prime_tiles(batch, layer, first, last, nsteps, k_cache, v_cache, ws):
+    for j in range(SLOTS):
+
+        @pl.when(j < nsteps)
+        def prime(j=j):
+            _issue_tiles(batch, layer, first, last, k_cache, v_cache, ws, j, j)
+
+
+def prefetch_kv(cfg: Config, batch: int, layer, pos_ref, k_cache, v_cache, ws):
+    """Issue the first `SLOTS` KV tile blocks of `attention_layer(..., primed=True)` early.
+
+    Legal as soon as the previous layer's attention loop has finished (the tile buffers are
+    free; the write-backs use the separate staging buffers)."""
+    ws = Workspace(*ws)
+    _, _, first, last, _, nsteps = _block_plan(cfg, batch, layer, pos_ref)
+    _prime_tiles(batch, layer, first, last, nsteps, k_cache, v_cache, ws)
+
+
 def wait_cache_writes(cfg: Config, batch: int, layer, pos_ref, k_cache, v_cache, ws):
     """Wait for the K/V tile write-backs issued by `attention_layer(..., wait_writes=False)`.
 
@@ -212,13 +252,16 @@ def attention_layer(
     *,
     tp: int = 8,
     wait_writes: bool = True,
+    primed: bool = False,
 ):
     """One layer of decode attention for `batch` rows (layouts in the module docstring).
 
     `layer` may be a traced int32 (the layer loop index): the layer kind is derived
     arithmetically (`cfg.full_attention_every/offset`), no `lax.cond`. Returns the
     `[B, hq*D]` f32 (bf16-valued) gated attention output; the new K/V rows are written to
-    `k_cache/v_cache[layer, b, pos[b]]` (asynchronously unless `wait_writes`).
+    `k_cache/v_cache[layer, b, pos[b]]` (asynchronously unless `wait_writes`). With
+    `primed=True` the first `SLOTS` KV tiles were already issued by `prefetch_kv` (same
+    `layer`, `pos_ref`), e.g. at the start of the layer, ahead of the dense-weight DMAs.
     """
     ws = Workspace(*ws)
     if k_cache.shape[2] % TOKENS or v_cache.shape[2] % TOKENS:
@@ -232,12 +275,7 @@ def attention_layer(
     not_full = 1 - is_full.astype(jnp.int32)
 
     # ---- per-row block range (scalars) --------------------------------------------------
-    pos = [pos_ref[b] for b in range(B)]
-    lo = [jnp.maximum(p - (cfg.sliding_window - 1), 0) * not_full for p in pos]
-    first = [x // TOKENS for x in lo]
-    last = [p // TOKENS for p in pos]
-    count = [la - fi + 1 for fi, la in zip(first, last)]
-    nsteps = functools.reduce(jnp.maximum, count)
+    pos, lo, first, last, count, nsteps = _block_plan(cfg, B, layer, pos_ref)
 
     # ---- q / k / v preparation (all rows at once) --------------------------------------
     q = _head_norm(q_ref[...].reshape(B, hq, D), cfg.rms_eps)
@@ -256,14 +294,8 @@ def attention_layer(
     ws.acc[...] = jnp.zeros((B, hq, lanes), F32)
 
     # ---- KV tile stream -------------------------------------------------------------------
-    def block_of(b, j):
-        return jnp.minimum(first[b] + j, last[b])  # rows past their last block re-read it
-
     def issue(j, slot):
-        for b in range(B):
-            blk = block_of(b, j)
-            _tile_copy(k_cache, ws.kbuf, ws.ksem, layer, b, blk, slot).start()
-            _tile_copy(v_cache, ws.vbuf, ws.vsem, layer, b, blk, slot).start()
+        _issue_tiles(B, layer, first, last, k_cache, v_cache, ws, j, slot)
 
     def wait(j, slot):
         # DMA semaphores count bytes: one wait sized like the B row tiles of the slot.
@@ -273,11 +305,8 @@ def attention_layer(
         pltpu.make_async_copy(src_k, ws.kbuf.at[slot], ws.ksem.at[slot]).wait()
         pltpu.make_async_copy(src_v, ws.vbuf.at[slot], ws.vsem.at[slot]).wait()
 
-    for j in range(SLOTS):
-
-        @pl.when(j < nsteps)
-        def prime(j=j):
-            issue(j, j)
+    if not primed:
+        _prime_tiles(B, layer, first, last, nsteps, k_cache, v_cache, ws)
 
     tok = jax.lax.broadcasted_iota(jnp.int32, (TOKENS, lanes), 0)  # token within the tile
     col = jax.lax.broadcasted_iota(jnp.int32, (1, TOKENS), 1)

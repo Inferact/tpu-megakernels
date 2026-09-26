@@ -210,21 +210,28 @@ def test_mini_decode_interpret(mesh, mini_case, batch):
 
 def test_vmem_budget_real_config():
     cfg = Config()
-    assert dk.default_moe_slots(cfg, 1) == 4 and dk.default_moe_slots(cfg, 8) == 3
+    # packed int4 slots (3.4 MiB): the 4 default slots fit at every batch with the full ring
+    assert dk.default_geometry(cfg, 1) == (4, 12)
+    assert dk.default_geometry(cfg, 8) == (4, 12)
     for batch in (1, 8):
-        budget = dk.vmem_budget(cfg, batch)
+        slots, banks = dk.default_geometry(cfg, batch)
+        budget = dk.vmem_budget(cfg, batch, moe_slots=slots, banks=banks)
         assert budget["total"] <= dk.VMEM_EXPLICIT_LIMIT, budget
-    full = dk.vmem_budget(cfg, 8, moe_slots=4)  # measured: 64.16 MiB used by the compiler
+    full = dk.vmem_budget(cfg, 8, moe_slots=8)
     assert full["total"] > dk.VMEM_EXPLICIT_LIMIT
-    slot = full["moe"] - dk.vmem_budget(cfg, 8, moe_slots=3)["moe"]
-    assert slot == pytest.approx(6.2 * dk.MIB, rel=0.05)
-    assert dk.default_moe_slots(MINI, 8) == 4
+    slot = full["moe"] - dk.vmem_budget(cfg, 8, moe_slots=7)["moe"]
+    assert slot == pytest.approx(3.375 * dk.MIB, rel=0.02)  # 2 + 1 MiB packed + 0.375 scales
+    assert dk.default_geometry(MINI, 8) == (4, 12)
     assert dk.vmem_budget(MINI, 8)["total"] <= dk.VMEM_EXPLICIT_LIMIT
 
 
 def test_parse_options():
-    opts = dk.parse_options(frozenset({"interpret", "aux_hidden", "moe_slots=2"}))
+    opts = dk.parse_options(
+        frozenset({"interpret", "aux_hidden", "moe_slots=2", "wire=f32", "banks=10", "defer=none"})
+    )
     assert opts.interpret and opts.aux_hidden and opts.moe_slots == 2
+    assert opts.wire == jnp.float32 and opts.banks == 10 and opts.defer == "none"
+    assert dk.parse_options(frozenset()).wire == jnp.bfloat16
     with pytest.raises(ValueError):
         dk.parse_options(frozenset({"bogus"}))
 
@@ -355,7 +362,8 @@ def test_real_widths_smoke_tpu(mesh):
         cfg = Config(layers=layers)
         weights = random_rank_weights(mesh, cfg)
         for batch in (1, 8):
-            budget = dk.vmem_budget(cfg, batch)
+            slots, banks = dk.default_geometry(cfg, batch)
+            budget = dk.vmem_budget(cfg, batch, moe_slots=slots, banks=banks)
             assert budget["total"] <= 58 * dk.MIB
             decode = dk.make_decode(mesh, cfg, context, batch, return_logits=True)
             caches = zero_caches(mesh, cfg, batch, context)
