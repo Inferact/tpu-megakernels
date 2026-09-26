@@ -55,6 +55,9 @@ Payload rows of the collectives are padded to 8 (`stream.mxu_rows`); payloads na
     "moe_slots=N"      expert DMA slots (default: `default_moe_slots`, the largest count <= 4
                        that keeps the explicit VMEM total <= 58 MiB; one packed slot is 3.4 MiB
                        at real widths; measured: 4 slots beat 3, 5, 6 and 8 at B=1 and B=8)
+    "hier=on|off"      chip-hierarchical expert-output all-reduce (pair + 4-chip phases,
+                       collectives.py); default on at B >= 8 where the [64, 4096] payload
+                       gains 1 us (bf16 wire), off below (latency-bound payloads lose)
     "banks=N"          dense ring depth in 2 MiB loads (default: `default_geometry`, 12 unless a
                        shallower ring (>= 8; the depth is not measurable above 8) is needed to
                        fit 8 expert slots)
@@ -120,7 +123,7 @@ def parse_options(options):
     """`frozenset` of option strings -> namespace (see the module docstring)."""
     opts = SimpleNamespace(
         interpret=False, aux_hidden=False, moe_slots=None, skip=frozenset(), wire=BF16,
-        kv_late=False, defer=None, banks=None, flush="last",
+        kv_late=False, defer=None, banks=None, flush="last", hier=None,
     )
     for opt in options:
         if opt == "interpret":
@@ -139,6 +142,8 @@ def parse_options(options):
             opts.defer = opt.split("=", 1)[1]
             if opts.defer not in ("none", "next", "post"):
                 raise ValueError(f"unknown defer mode {opts.defer!r}")
+        elif opt.startswith("hier="):
+            opts.hier = {"on": True, "off": False}[opt.split("=", 1)[1]]
         elif opt.startswith("banks="):
             opts.banks = int(opt.split("=", 1)[1])
         elif opt.startswith("wire="):
@@ -202,9 +207,14 @@ def _collective_geometry(cfg: Config, batch, tp):
     return rows, width, max(cfg.moe_hidden // tp, cfg.hidden // tp)
 
 
+def default_hier(batch):
+    """The hierarchical expert-output all-reduce pays only for the B=8 `[64, 4096]` payload."""
+    return batch >= 8
+
+
 def scratch_shapes(
     cfg: Config, batch, tp=8, moe_slots=moe.SLOTS, aux_hidden=False, wire=BF16,
-    banks=layout.BANKS, packed=True,
+    banks=layout.BANKS, packed=True, hier=None,
 ):
     """The kernel's scratch, grouped: `{group: tuple of pltpu.VMEM / semaphores}` in order.
     `packed=False` (interpret mode) uses plain int4 expert slots."""
@@ -220,6 +230,7 @@ def scratch_shapes(
         "collectives": collectives.scratch_shapes(
             rows, width, tp, gather_rows=8, gather_width=gather_width,
             bf16_wire=wire == BF16, f32_wire=wire == F32,
+            hierarchical=default_hier(batch) if hier is None else hier,
         ),
         "attention": attention.scratch_shapes(cfg, batch, tp),
         "attention_io": (
@@ -265,7 +276,7 @@ def default_geometry(cfg: Config, batch, tp=8, aux_hidden=False, wire=BF16):
 
 def vmem_budget(
     cfg: Config, batch, tp=8, moe_slots=None, aux_hidden=False, log=print, wire=BF16,
-    banks=layout.BANKS,
+    banks=layout.BANKS, hier=None,
 ):
     """Explicit VMEM allocations of the kernel in bytes per group (+ `total`), printed via `log`.
 
@@ -275,7 +286,7 @@ def vmem_budget(
     """
     if moe_slots is None:
         moe_slots = default_moe_slots(cfg, batch, tp, aux_hidden, wire, banks)
-    groups = scratch_shapes(cfg, batch, tp, moe_slots, aux_hidden, wire, banks)
+    groups = scratch_shapes(cfg, batch, tp, moe_slots, aux_hidden, wire, banks, hier=hier)
     out = {name: _scratch_bytes(shapes) for name, shapes in groups.items()}
     vp = layout.vocab_pad(cfg, tp)
     out["logits_acc"] = _padded_bytes((LOGIT_ROWS, vp), F32)
@@ -306,14 +317,16 @@ def _pad_rows(x, rows):
     return jnp.pad(x, ((0, rows - b), (0, 0)))
 
 
-def _all_reduce(x, ws, phase, tp, wire=BF16):
+def _all_reduce(x, ws, phase, tp, wire=BF16, hierarchical=False):
     """`all_reduce_rows` of any `[R, W]` f32: rows padded to 8, `W < tp*128` folded into
     `tp*128`-wide rows (row group `i` in lanes `i*W:(i+1)*W`), result sliced back to `[R, W]`."""
     rows, width = x.shape
     unit = tp * 128
     if width % unit == 0:
         rp = -(-rows // 8) * 8
-        return collectives.all_reduce_rows(_pad_rows(x, rp), ws, phase, wire=wire)[:rows]
+        return collectives.all_reduce_rows(
+            _pad_rows(x, rp), ws, phase, wire=wire, hierarchical=hierarchical
+        )[:rows]
     if unit % width:
         raise ValueError(f"all-reduce width {width} must divide or be a multiple of {unit}")
     f = unit // width
@@ -363,7 +376,7 @@ def _kernel_body(cfg: Config, batch, tp, opts):
     n_weights = len(WEIGHT_NAMES)
     groups = scratch_shapes(
         cfg, B, tp, opts.moe_slots, opts.aux_hidden, opts.wire, opts.banks,
-        packed=not opts.interpret,
+        packed=not opts.interpret, hier=opts.hier,
     )
     sizes = {name: len(shapes) for name, shapes in groups.items()}
 
@@ -384,16 +397,18 @@ def _kernel_body(cfg: Config, batch, tp, opts):
         skip = opts.skip
         lm_head = None if "lm_head" in skip else weights["lm_head"]
         ring = stream.make_ring(cfg, scratch["ring"], weights, lm_head, tp=tp)
-        ws = collectives.workspace(*scratch["collectives"], f32_wire=opts.wire == F32)
+        ws = collectives.workspace(
+            *scratch["collectives"], f32_wire=opts.wire == F32, hierarchical=opts.hier
+        )
         dots = "dense_dots" not in skip
 
         def gemv(x, family, l, **kw):
             return stream.gemv(ring, x, family, l, compute=dots, **kw)
 
-        def all_reduce(x, phase):
+        def all_reduce(x, phase, hierarchical=False):
             if "collectives" in skip:
                 return x
-            return _all_reduce(x, ws, phase, tp, opts.wire)
+            return _all_reduce(x, ws, phase, tp, opts.wire, hierarchical and opts.hier)
 
         def all_gather(x, phase):
             if "collectives" in skip:
@@ -513,7 +528,7 @@ def _kernel_body(cfg: Config, batch, tp, opts):
             else:
                 sc.y_out[...] = jnp.broadcast_to(h1[:1].astype(F32), sc.y_out.shape) * 0.01
                 stream.flush_deferred(ring)
-            Y = all_reduce(sc.y_out[...], phase + 2)  # [K*B, Hm]
+            Y = all_reduce(sc.y_out[...], phase + 2, hierarchical=True)  # [K*B, Hm]
             m = moe.finalize(cfg, Y, sc.w, v("post_expert_norm", l), B)  # [B, Hm]
             out = gemv(m, "post", l)  # [B, H/tp] f32
             ffn_out = all_gather(r16(out), phase + 3)  # [B, H]
@@ -562,6 +577,8 @@ def make_kernel(cfg: Config, context, batch, *, tp=8, options=frozenset()):
         opts.moe_slots = default_moe_slots(cfg, batch, tp, opts.aux_hidden, opts.wire, opts.banks)
     if opts.defer is None:
         opts.defer = "next" if batch <= 4 else "none"
+    if opts.hier is None:
+        opts.hier = default_hier(batch)
     if context % attention.TOKENS:
         raise ValueError(f"context must be a multiple of {attention.TOKENS}")
     if not 1 <= batch <= moe.MR:
@@ -625,7 +642,10 @@ def make_decode(
     return_logits = return_logits or not greedy
     kernel, opts = make_kernel(cfg, context, batch, tp=tp, options=options)
     vp = layout.vocab_pad(cfg, tp)
-    vmem_budget(cfg, batch, tp, opts.moe_slots, opts.aux_hidden, wire=opts.wire, banks=opts.banks)
+    vmem_budget(
+        cfg, batch, tp, opts.moe_slots, opts.aux_hidden, wire=opts.wire, banks=opts.banks,
+        hier=opts.hier,
+    )
 
     def local(weights, caches, tokens, pos):
         w = {name: value[0] for name, value in weights.items()}

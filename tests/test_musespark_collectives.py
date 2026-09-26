@@ -176,18 +176,53 @@ def test_all_reduce_vs_psum(rows, width):
         np.testing.assert_array_equal(got[r], got[0])
 
 
+def _hier_kernel(x_ref, o_ref, *scratch, wire):
+    ws = col.workspace(*scratch, hierarchical=True)
+    col.barrier()
+    o_ref[...] = col.all_reduce_rows(
+        col.all_reduce_rows(x_ref[...], ws, jnp.int32(0), wire=wire, hierarchical=True) * 0.125,
+        ws, jnp.int32(1), wire=wire, hierarchical=True,
+    )
+
+
+@pytest.mark.parametrize("rows,width", [(8, 8192), (64, 4096)])
+@pytest.mark.parametrize("wire", [jnp.float32, jnp.bfloat16])
+def test_hierarchical_all_reduce_vs_psum(rows, width, wire):
+    """Two chained hierarchical all-reduces (both slots) == psum (of psum / 8); bit-identical
+    on every rank."""
+    mesh = _mesh()
+    x = jax.random.normal(jax.random.PRNGKey(5), (TP * rows, width), jnp.float32)
+    x = x.astype(jnp.bfloat16).astype(jnp.float32)
+    vm = pl.BlockSpec(memory_space=pltpu.VMEM)
+    f = _call(
+        functools.partial(_hier_kernel, wire=wire),
+        jax.ShapeDtypeStruct((rows, width), jnp.float32),
+        [vm],
+        col.scratch_shapes(rows, width, bf16_wire=wire == jnp.bfloat16, hierarchical=True),
+        15,
+        not ON_TPU,
+    )
+    got = np.asarray(_sharded(mesh, f, 1, 1)(_put(mesh, x))).reshape(TP, rows, width)
+    ref = np.asarray(x).reshape(TP, rows, width).sum(0)
+    ref = np.broadcast_to(ref * 0.125, (TP, rows, width)).sum(0)
+    tol = 3e-2 if wire == jnp.bfloat16 else 1e-4
+    np.testing.assert_allclose(got[0], ref, rtol=tol, atol=tol)
+    for r in range(1, TP):
+        np.testing.assert_array_equal(got[r], got[0])
+
+
 # ---------------------------------------------------------------------------------------
 # TPU timing: 200 in-kernel iterations of each collective
 # ---------------------------------------------------------------------------------------
 REPS = 200
 
 
-def _timed_reduce_kernel(x_ref, o_ref, *scratch, wire=jnp.float32):
-    ws = col.workspace(*scratch)
+def _timed_reduce_kernel(x_ref, o_ref, *scratch, wire=jnp.float32, hierarchical=False):
+    ws = col.workspace(*scratch, hierarchical=hierarchical)
     col.barrier()
 
     def body(i, carry):
-        o_ref[...] = col.all_reduce_rows(x_ref, ws, i, wire=wire)
+        o_ref[...] = col.all_reduce_rows(x_ref, ws, i, wire=wire, hierarchical=hierarchical)
         return carry
 
     lax.fori_loop(0, REPS, body, 0)
@@ -220,32 +255,38 @@ def test_timing_tpu():
     mesh = _mesh()
     vm = pl.BlockSpec(memory_space=pltpu.VMEM)
     report = []
-    for rows, width, wire in [
-        (8, 8192, jnp.float32),
-        (64, 4096, jnp.float32),
-        (8, 8192, jnp.bfloat16),
-        (64, 4096, jnp.bfloat16),
+    for rows, width, wire, hier in [
+        (8, 8192, jnp.float32, False),
+        (64, 4096, jnp.float32, False),
+        (8, 8192, jnp.bfloat16, False),
+        (64, 4096, jnp.bfloat16, False),
+        (8, 8192, jnp.bfloat16, True),
+        (64, 4096, jnp.bfloat16, True),
+        (64, 4096, jnp.float32, True),
     ]:
         x = jax.random.normal(jax.random.PRNGKey(3), (TP * rows, width), jnp.float32)
         if wire == jnp.bfloat16:
             x = x.astype(jnp.bfloat16).astype(jnp.float32)
         f = _call(
-            functools.partial(_timed_reduce_kernel, wire=wire),
+            functools.partial(_timed_reduce_kernel, wire=wire, hierarchical=hier),
             jax.ShapeDtypeStruct((rows, width), jnp.float32),
             [vm],
-            col.scratch_shapes(rows, width, bf16_wire=wire == jnp.bfloat16),
+            col.scratch_shapes(rows, width, bf16_wire=wire == jnp.bfloat16, hierarchical=hier),
             13,
             False,
         )
         us, out = _time(_sharded(mesh, f, 1, 1), _put(mesh, x))
         got = np.asarray(out).reshape(TP, rows, width)
         exp = np.asarray(x).reshape(TP, rows, width).sum(0)
-        tol = 2e-2 if wire == jnp.bfloat16 else 1e-5
+        # bf16 wire: one rounding of the reduced block (two for the hierarchical scheme:
+        # pair sum, then chip sum) on sums of magnitude up to ~10
+        tol = (4e-2 if hier else 2e-2) if wire == jnp.bfloat16 else 1e-5
         np.testing.assert_allclose(got[0], exp, rtol=tol, atol=tol)
         for r in range(1, TP):
             np.testing.assert_array_equal(got[r], got[0])
         report.append(
-            f"all_reduce_rows [{rows}, {width}] wire {jnp.dtype(wire).name}: {us * 1e6:.2f} us"
+            f"all_reduce_rows [{rows}, {width}] wire {jnp.dtype(wire).name}"
+            f"{' hierarchical' if hier else ''}: {us * 1e6:.2f} us"
         )
     for rows, w, dtype in [(8, 1024, jnp.bfloat16), (8, 1024, jnp.float32), (8, 512, jnp.bfloat16)]:
         x = jax.random.normal(jax.random.PRNGKey(4), (TP * rows, w), jnp.float32).astype(dtype)

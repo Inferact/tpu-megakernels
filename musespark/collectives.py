@@ -18,6 +18,18 @@ rows, and tile-aligned row groups of a block narrower than 1024 are placed side 
 (`Wire`); both are free relayouts (128-lane / 8-row aligned slices). Blocks that fold
 neither way use a zero-padded `[roundup(R, tile), roundup(wb, 128)]` window.
 
+Hierarchical all-reduce (`all_reduce_rows(..., hierarchical=True)`, needs
+`scratch_shapes(..., hierarchical=True)`): the 8 cores are 4 chips x 2 cores and the sibling
+core `rank ^ 1` is reachable at 100-600 GB/s while every ICI link is ~45 GB/s per core
+(hwbench/hier_bench.py). Rank `r` owns half `r % 2` of the columns: (1) pair reduce-scatter
+of the halves over the sibling link, (2) reduce-scatter of the half's 4 quarters across the
+4 chips (one message per link: quarter `j` -> core `2j + r % 2`), (3) all-gather of the
+reduced quarters across the chips, (4) pair all-gather of the halves. Cross-chip bytes halve
+(the sibling's contribution is pre-reduced) at the price of 4 latency phases instead of 2, so
+it only pays for the large payloads (`[64, 4096]`: 13.5 vs 14.5 us bf16 wire, 19.9 vs 25.4 us
+f32; `[8, 8192]`: 9.3 vs 7.3 us bf16). Summation order: sibling pair (commutative, 2
+operands), then chips 0..3 -- fixed, so every rank gets the identical result.
+
 Two slots suffice (`phase % 2`). Every collective ends only after all 7 sends AND 7 receives
 of the calling rank completed, so when rank A starts collective c+1 it has already received
 rank B's messages of c, i.e. B has *started* c, but B may still be reading its receive
@@ -127,8 +139,41 @@ def wire_rows(rows, width, tp=TP, row_tile=8):
     return _wire(rows, width // tp, row_tile).fr
 
 
+def hier_shapes(rows, width, tp=TP, wire=jnp.bfloat16):
+    """Buffers + semaphores of the hierarchical all-reduce of `[rows, width]` (`wire` dtype)."""
+    if tp != 8:
+        raise ValueError("the hierarchical all-reduce assumes 8 cores = 4 chips x 2")
+    rt = 16 if wire == jnp.bfloat16 else 8
+    half = _wire(rows, width // 2, rt)
+    quarter = _wire(rows, width // 8, rt)
+    return (
+        pltpu.VMEM((half.fr, half.fl), wire),  # h_send: the sibling's half of my partial
+        pltpu.VMEM((2, half.fr, half.fl), wire),  # h_recv[slot]: the sibling's copy of my half
+        pltpu.VMEM((4, quarter.fr, quarter.fl), wire),  # q_send[chip j]
+        pltpu.VMEM((2, 4, quarter.fr, quarter.fl), wire),  # q_recv[slot, source chip]
+        pltpu.VMEM((2, 4, quarter.fr, quarter.fl), wire),  # q_ag[slot, owner chip]
+        pltpu.VMEM((2, half.fr, half.fl), wire),  # h_ag[slot]: my reduced half (AG source)
+        pltpu.SemaphoreType.DMA((2, 1)),  # pair RS send / recv
+        pltpu.SemaphoreType.DMA((2, 1)),
+        pltpu.SemaphoreType.DMA((2, 3)),  # chip RS
+        pltpu.SemaphoreType.DMA((2, 3)),
+        pltpu.SemaphoreType.DMA((2, 3)),  # chip AG
+        pltpu.SemaphoreType.DMA((2, 3)),
+        pltpu.SemaphoreType.DMA((2, 1)),  # pair AG
+        pltpu.SemaphoreType.DMA((2, 1)),
+    )
+
+
+_HIER_NAMES = (
+    "h_send", "h_recv", "q_send", "q_recv", "q_ag", "h_ag",
+    "hp_send_sems", "hp_recv_sems", "hq_send_sems", "hq_recv_sems",
+    "ha_send_sems", "ha_recv_sems", "hg_send_sems", "hg_recv_sems",
+)
+
+
 def scratch_shapes(
-    rows, width=8192, tp=TP, gather_rows=8, gather_width=None, bf16_wire=False, f32_wire=True
+    rows, width=8192, tp=TP, gather_rows=8, gather_width=None, bf16_wire=False, f32_wire=True,
+    hierarchical=False,
 ):
     """Scratch for the collectives, in the order `workspace()` consumes it.
 
@@ -137,6 +182,8 @@ def scratch_shapes(
     (default `[8, width // tp]`). Sizes for (64, 4096): 1 + 2 + 2 + 0.25 + 0.25 MiB with the
     f32 wire, plus / or half of that with `bf16_wire` (the bf16-payload all-reduce buffers;
     `f32_wire=False` drops the f32 ones, then only `wire=jnp.bfloat16` reductions are legal).
+    `hierarchical=True` appends the `hier_shapes` of the largest payload (bf16 wire unless
+    only the f32 wire is allocated).
     """
     if gather_width is None:
         gather_width = width // tp
@@ -169,6 +216,8 @@ def scratch_shapes(
             pltpu.VMEM((2, tp, wr16, WIRE_LANES), jnp.bfloat16),  # rs_recv16
             pltpu.VMEM((2, tp, wr16, WIRE_LANES), jnp.bfloat16),  # ag_recv16
         )
+    if hierarchical:
+        shapes += hier_shapes(rows, width, tp, jnp.bfloat16 if bf16_wire else jnp.float32)
     return shapes
 
 
@@ -186,19 +235,22 @@ _WS_NAMES = (
 _WS_NAMES16 = ("send16", "rs_recv16", "ag_recv16")
 
 
-def workspace(*refs, f32_wire=True):
-    """Bind the refs allocated from `scratch_shapes(..., f32_wire=f32_wire)` (same order) into a
-    namespace; whether the bf16 wire buffers are present is inferred from the count."""
+def workspace(*refs, f32_wire=True, hierarchical=False):
+    """Bind the refs allocated from `scratch_shapes(..., f32_wire=f32_wire,
+    hierarchical=hierarchical)` (same order) into a namespace; whether the bf16 wire buffers
+    are present is inferred from the count."""
     names = (_WS_NAMES32 if f32_wire else ()) + _WS_NAMES
-    if len(refs) == len(names) + len(_WS_NAMES16):
+    tail = _HIER_NAMES if hierarchical else ()
+    if len(refs) == len(names) + len(_WS_NAMES16) + len(tail):
         names += _WS_NAMES16
-    elif len(refs) != len(names):
+    elif len(refs) != len(names) + len(tail):
         raise ValueError(
-            f"workspace expects {len(names)} or {len(names) + len(_WS_NAMES16)} refs, "
-            f"got {len(refs)}"
+            f"workspace expects {len(names) + len(tail)} or "
+            f"{len(names) + len(_WS_NAMES16) + len(tail)} refs, got {len(refs)}"
         )
+    names += tail
     ws = SimpleNamespace(**dict(zip(names, refs)))
-    for name in _WS_NAMES32 + _WS_NAMES16:
+    for name in _WS_NAMES32 + _WS_NAMES16 + _HIER_NAMES:
         if not hasattr(ws, name):
             setattr(ws, name, None)
     ws.tp = ws.g_recv_f32.shape[1]
@@ -241,7 +293,89 @@ def _exchange(src_view, dst_view, send_sems, recv_sems, slot, rank, tp, peer_src
         copy.wait()
 
 
-def all_reduce_rows(x, ws, phase, wire=jnp.float32):
+def _exchange_pairs(pairs, send_sems, recv_sems, slot):
+    """`pairs`: `(src_view, dst_view, peer)` remote copies; start all, wait all."""
+    copies = []
+    for j, (src, dst, peer) in enumerate(pairs):
+        copy = pltpu.make_async_remote_copy(
+            src, dst, send_sems.at[slot, j], recv_sems.at[slot, j], device_id=(peer,),
+            device_id_type=_MESH,
+        )
+        copy.start()
+        copies.append(copy)
+    for copy in copies:
+        copy.wait()
+
+
+def _all_reduce_hier(x, ws, phase, wire):
+    """The hierarchical all-reduce (module docstring); `x` f32 `[R, W]`, W % 1024 == 0."""
+    if ws.h_send is None:
+        raise ValueError("hierarchical all-reduce needs scratch_shapes(..., hierarchical=True)")
+    if jnp.dtype(ws.h_send.dtype) != jnp.dtype(wire):
+        raise ValueError(f"hierarchical scratch was allocated for the {ws.h_send.dtype} wire")
+    rank = lax.axis_index(AXIS)
+    even = (rank % 2) == 0
+    chip = rank // 2
+    slot = phase % 2
+    rows, width = x.shape
+    rt = 16 if wire == jnp.bfloat16 else 8
+    hw = _wire(rows, width // 2, rt)
+    qw = _wire(rows, width // 8, rt)
+    if hw.fr > ws.h_send.shape[0] or qw.fr > ws.q_send.shape[1]:
+        raise ValueError(f"payload [{rows}, {width}] exceeds the hierarchical scratch")
+    hwin = (pl.ds(0, hw.fr), pl.ds(0, hw.fl))
+    qwin = (pl.ds(0, qw.fr), pl.ds(0, qw.fl))
+    w2, w8 = width // 2, width // 8
+    xw = x.astype(wire)
+    lo, hi = xw[:, :w2], xw[:, w2:]
+    mine, other = jnp.where(even, lo, hi), jnp.where(even, hi, lo)
+    # (1) pair reduce-scatter: the sibling receives its half of my partial
+    ws.h_send[hwin[0], hwin[1]] = hw.to_wire(other)
+    _exchange_pairs(
+        [(ws.h_send.at[hwin[0], hwin[1]], ws.h_recv.at[slot, hwin[0], hwin[1]], rank ^ 1)],
+        ws.hp_send_sems, ws.hp_recv_sems, slot,
+    )
+    half = mine.astype(jnp.float32) + hw.from_wire(ws.h_recv[slot, hwin[0], hwin[1]]).astype(
+        jnp.float32
+    )
+    # (2) chip reduce-scatter of the quarters: quarter j -> core (2j + rank % 2)
+    for j in range(4):
+        ws.q_send[j, qwin[0], qwin[1]] = qw.to_wire(half[:, j * w8 : (j + 1) * w8].astype(wire))
+    pairs = []
+    for offset in (2, 4, 6):
+        peer = rank ^ offset
+        pairs.append(
+            (ws.q_send.at[peer // 2, qwin[0], qwin[1]], ws.q_recv.at[slot, chip, qwin[0], qwin[1]],
+             peer)
+        )
+    _exchange_pairs(pairs, ws.hq_send_sems, ws.hq_recv_sems, slot)
+    ws.q_recv[slot, chip, qwin[0], qwin[1]] = ws.q_send[chip, qwin[0], qwin[1]]
+    total = ws.q_recv[slot, 0, qwin[0], qwin[1]].astype(jnp.float32)
+    for j in range(1, 4):
+        total = total + ws.q_recv[slot, j, qwin[0], qwin[1]].astype(jnp.float32)
+    ws.q_ag[slot, chip, qwin[0], qwin[1]] = total.astype(wire)
+    # (3) chip all-gather of the reduced quarters
+    src = ws.q_ag.at[slot, chip, qwin[0], qwin[1]]
+    _exchange_pairs(
+        [(src, src, rank ^ offset) for offset in (2, 4, 6)], ws.ha_send_sems, ws.ha_recv_sems,
+        slot,
+    )
+    half_red = jnp.concatenate(
+        [qw.from_wire(ws.q_ag[slot, j, qwin[0], qwin[1]]) for j in range(4)], axis=1
+    ).astype(jnp.float32)
+    # (4) pair all-gather of the halves (lands in h_recv, free again after step 1)
+    ws.h_ag[slot, hwin[0], hwin[1]] = hw.to_wire(half_red.astype(wire))
+    _exchange_pairs(
+        [(ws.h_ag.at[slot, hwin[0], hwin[1]], ws.h_recv.at[slot, hwin[0], hwin[1]], rank ^ 1)],
+        ws.hg_send_sems, ws.hg_recv_sems, slot,
+    )
+    other_red = hw.from_wire(ws.h_recv[slot, hwin[0], hwin[1]]).astype(jnp.float32)
+    return jnp.concatenate(
+        [jnp.where(even, half_red, other_red), jnp.where(even, other_red, half_red)], axis=1
+    )
+
+
+def all_reduce_rows(x, ws, phase, wire=jnp.float32, hierarchical=False):
     """Sum an f32 `[R, W]` partial over the tp ranks; bit-identical result everywhere.
 
     Reduce-scatter over the tp column blocks (rank j sums block j of all ranks in slot order
@@ -250,7 +384,7 @@ def all_reduce_rows(x, ws, phase, wire=jnp.float32):
     `wire=jnp.bfloat16` (needs `scratch_shapes(..., bf16_wire=True)`) the partials and the
     reduced blocks travel as bf16: half the bytes, but every partial is rounded to bf16
     before the f32 summation and the result is bf16-valued (the caller's `r16` is then a
-    no-op).
+    no-op). `hierarchical=True` uses the chip-aware 4-phase scheme (module docstring).
     """
     tp = ws.tp
     rank = lax.axis_index(AXIS)
@@ -259,6 +393,8 @@ def all_reduce_rows(x, ws, phase, wire=jnp.float32):
     rows, width = x.shape
     if width % (tp * 128):
         raise ValueError(f"all_reduce_rows width {width} must be a multiple of {tp * 128}")
+    if hierarchical:
+        return _all_reduce_hier(x, ws, phase, wire)
     wb = width // tp
     if wire == jnp.bfloat16:
         if ws.send16 is None:
@@ -343,6 +479,7 @@ __all__ = [
     "all_reduce_rows",
     "barrier",
     "compiler_params",
+    "hier_shapes",
     "scratch_shapes",
     "wire_rows",
     "workspace",
