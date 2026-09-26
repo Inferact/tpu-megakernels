@@ -99,3 +99,49 @@ def test_chunked_scales():
     assert short.shape == (1, 1, 1024)
     with pytest.raises(ValueError):
         quant.quantize_int4(w, 100)
+
+
+# ---------------------------------------------------------------------------------------
+# int8 per-output-channel (dense projections, lm_head)
+# ---------------------------------------------------------------------------------------
+@pytest.mark.parametrize("shape", [(512, 256), (3, 256, 128), (1024, 2048)])
+def test_int8_round_trip_and_error_bound(shape):
+    w = _weights(shape, 11)
+    w[..., :, 0] = 0  # a dead output column
+    q, s = quant.quantize_int8(w)
+    assert q.dtype == np.int8 and q.shape == w.shape
+    assert s.dtype == np.float32 and s.shape == shape[:-2] + (1, shape[-1])
+    assert q.min() >= -127 and q.max() <= 127
+    assert (s[..., 0, 0] == 1).all() and not q[..., :, 0].any()
+    d = quant.dequantize_int8(q, s)
+    # |w - q*s| <= s/2 up to the f32 rounding of the reciprocal multiply (<= 127 * 2^-24 quanta)
+    assert (np.abs(w - d) <= s / 2 * (1 + 2.0**-15)).all()
+    assert np.array_equal(d, q.astype(np.float32) * s)
+    # the abs-max element of every live column hits +-127
+    assert (np.abs(q).max(axis=-2)[..., 1:] == 127).all()
+    # bf16 inputs are quantized from their exact f32 values
+    wb = w.astype(ml_dtypes.bfloat16)
+    qb, sb = quant.quantize_int8(wb)
+    qf, sf = quant.quantize_int8(wb.astype(np.float32))
+    assert np.array_equal(qb, qf) and np.array_equal(sb, sf)
+
+
+def test_int8_numpy_equals_jnp():
+    w = _weights((2, 1024, 512), 12)
+    w[0, :, 3] = 0
+    q, s = quant.quantize_int8(w)
+    qj, sj = quant.quantize_int8(jnp.asarray(w))
+    assert isinstance(qj, jax.Array) and qj.dtype == jnp.int8 and sj.dtype == jnp.float32
+    assert np.array_equal(np.asarray(qj), q) and np.array_equal(np.asarray(sj), s)
+    dj = quant.dequantize_int8(qj, sj)
+    assert isinstance(dj, jax.Array) and np.array_equal(np.asarray(dj), quant.dequantize_int8(q, s))
+    # the kernel's maths: dot(x, q) * s equals dot(x, dequant) up to f32 summation
+    x = np.random.default_rng(0).standard_normal((4, 1024), np.float32).astype(ml_dtypes.bfloat16)
+    got = np.asarray(quant.int8_dot(jnp.asarray(x), qj[0], sj[0]))
+    want = x.astype(np.float32) @ quant.dequantize_int8(q[0], s[0])
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-3 * np.abs(want).max())
+    # round half to even
+    ties = np.array([[0.5, 1.5, 2.5, -0.5, -1.5, 127.0]], np.float32)  # one column each
+    qt, st = quant.quantize_int8(np.concatenate([ties, np.full_like(ties, 127.0)], axis=0))
+    assert st.tolist() == [[1.0] * 6]
+    assert qt[0].tolist() == [0, 2, 2, 0, -2, 127]

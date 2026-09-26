@@ -1,4 +1,8 @@
-"""Symmetric int4 group quantization for the Muse Spark routed experts (design.md section 2).
+"""Weight quantizers of the Muse Spark kernels: int4 g128 (routed experts, container v1), NVFP4
+(experts, container v2) and int8 per-output-channel (dense projections + lm_head, `dense_format
+int8`, see the int8 section below).
+
+Symmetric int4 group quantization for the Muse Spark routed experts (design.md section 2).
 
 Layout: a weight is `[..., K, N]` with K the contraction axis (`y = x @ w`). Groups are `G`
 consecutive rows of K per output column. For each group
@@ -164,6 +168,89 @@ def unpack_int4_jnp(packed):
     hi = (((p >> 4) & 0xF) ^ 0x8) - 0x8
     out = jnp.stack((lo, hi), axis=-1).reshape(p.shape[:-1] + (p.shape[-1] * 2,))
     return out.astype(jnp.int8).astype(jnp.int4)
+
+
+# ---------------------------------------------------------------------------------------------
+# int8 per-output-channel (the dense projections and the lm_head)
+# ---------------------------------------------------------------------------------------------
+#
+# A `[..., K, N]` weight (K the contraction axis) gets ONE f32 scale per output column:
+#
+#     scale[n] = absmax_k |w[k, n]| * f32(1/127)        (all-zero columns: scale = 1)
+#     q[k, n]  = clip(round_half_even(w[k, n] * (1/scale[n])), -127, 127)      int8
+#
+# so `dequant = q * scale` (exact in f32: q has <= 7 significant bits). The kernel never forms
+# the dequantized weight: it computes `dot(x_bf16, q_int8) -> f32` on the MXU (int8 values are
+# exact in bf16, so the products are the same as a bf16 x bf16 dot of the dequantized weight
+# would give BEFORE its rounding) and multiplies the f32 column sums by `scale` afterwards.
+# The reciprocal multiplies are spelled out (see the int4 note above) so the numpy and jnp
+# quantizers are bit-identical.
+
+INT8_MAX = 127
+INV_INT8_MAX = np.float32(1.0 / INT8_MAX)
+
+
+def quantize_int8_np(w):
+    """numpy: f32/bf16 `[..., K, N]` -> (`q` int8 `[..., K, N]` in [-127, 127], `scale` f32
+    `[..., 1, N]`), symmetric per output column (absmax / 127, round half to even)."""
+    w = np.asarray(w)
+    if w.dtype != np.float32:
+        w = w.astype(np.float32)
+    amax = np.max(np.abs(w), axis=-2, keepdims=True)  # [..., 1, N]
+    scale = (amax * INV_INT8_MAX).astype(np.float32)
+    scale = np.where(scale == 0, np.float32(1), scale).astype(np.float32)
+    q = np.rint(w * (np.float32(1) / scale))
+    q = np.clip(q, -INT8_MAX, INT8_MAX).astype(np.int8)
+    return q, scale
+
+
+def _quantize_int8_jnp(w):
+    w = jnp.asarray(w, jnp.float32)
+    amax = jnp.max(jnp.abs(w), axis=-2, keepdims=True)
+    scale = amax * INV_INT8_MAX
+    scale = jnp.where(scale == 0, jnp.float32(1), scale)
+    q = jnp.round(w * (jnp.float32(1) / scale))  # round half to even, like np.rint
+    q = jnp.clip(q, -INT8_MAX, INT8_MAX).astype(jnp.int8)
+    return q, scale
+
+
+quantize_int8_jnp = jax.jit(_quantize_int8_jnp)
+quantize_int8_jnp.__doc__ = (
+    "jnp (jitted): `[..., K, N]` -> (`q` int8 `[..., K, N]`, `scale` f32 `[..., 1, N]`); "
+    "bit-identical to `quantize_int8_np`."
+)
+
+
+def quantize_int8(w):
+    """Dispatch on the input: numpy in -> numpy out, jax Array in -> jax out."""
+    if isinstance(w, jax.Array):
+        return quantize_int8_jnp(w)
+    return quantize_int8_np(w)
+
+
+def dequantize_int8_np(q, scale):
+    """numpy: `q * scale` in f32 (exact), `[..., K, N]`."""
+    return np.asarray(q).astype(np.float32) * np.asarray(scale, np.float32)
+
+
+def dequantize_int8_jnp(q, scale):
+    """jnp: `q * scale` in f32 (exact), `[..., K, N]`."""
+    return jnp.asarray(q).astype(jnp.float32) * jnp.asarray(scale, jnp.float32)
+
+
+def dequantize_int8(q, scale):
+    """Dispatch on the input type; returns f32 `[..., K, N]` (numpy or jax)."""
+    if isinstance(q, jax.Array) or isinstance(scale, jax.Array):
+        return dequantize_int8_jnp(q, scale)
+    return dequantize_int8_np(q, scale)
+
+
+def int8_dot(x, q, scale):
+    """jnp: the kernel's int8 dense maths, `dot(bf16(x), bf16(q)) * scale` -> f32 `[..., N]`
+    (exact int8 -> bf16 conversion; XLA/MXU f32 accumulation)."""
+    y = jnp.dot(jnp.asarray(x).astype(jnp.bfloat16), jnp.asarray(q).astype(jnp.bfloat16),
+                preferred_element_type=jnp.float32)
+    return y * jnp.asarray(scale, jnp.float32)
 
 
 # ---------------------------------------------------------------------------------------------
