@@ -315,13 +315,54 @@ def test_fp4_block_dot_matches_dequant_reference(K, N, rows):
     assert x_bd.shape == fp4.block_diag16_shape(K, rows)
     out = np.asarray(run_fp4_block_dot(x_bd, jnp.asarray(packed), jnp.asarray(quant.fp4_scales_to_chunked(bs, K)), rows))
     assert np.abs(out - ref).max() <= 1e-3 * np.abs(ref).max()
-    # block-diagonal expansion: row block g of chunk i holds x masked to group g
+    # block-diagonal expansion (batch-major): row b*GPC + g of chunk i is x[b] masked to group g
     chunk = np.asarray(x_bd[0]).astype(np.float32)
     kc = x_bd.shape[2]
-    for g in (0, kc // 16 - 1):
-        block = chunk[g * rows:(g + 1) * rows]
-        assert np.array_equal(block[:, g * 16:(g + 1) * 16], x[:, g * 16:(g + 1) * 16])
-        assert not np.delete(block, np.s_[g * 16:(g + 1) * 16], axis=1).any()
+    gpc = kc // 16
+    for b in (0, rows - 1):
+        for g in (0, gpc - 1):
+            row = chunk[b * gpc + g]
+            assert np.array_equal(row[g * 16:(g + 1) * 16], x[b, g * 16:(g + 1) * 16])
+            assert not np.delete(row, np.s_[g * 16:(g + 1) * 16]).any()
+
+
+def run_fp4_dequant_dot(x, packed, bs_chunked):
+    """`fp4.scale_words` of the e4m3 chunked scales into a VMEM scratch + `fp4.fp4_dequant_dot`."""
+    K = packed.shape[0] * 8
+
+    def kernel(x_ref, w_ref, s_ref, o_ref, sd_ref):
+        sd_ref[...] = fp4.scale_words(s_ref)
+        o_ref[...] = fp4.fp4_dequant_dot(x_ref[...], w_ref, sd_ref)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((x.shape[0], packed.shape[1]), jnp.float32),
+        in_specs=[VM, VM, VM],
+        out_specs=VM,
+        scratch_shapes=[pltpu.VMEM((K // 16, packed.shape[1]), jnp.int32)],
+        interpret=INTERPRET,
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=48 << 20),
+    )(x, packed, bs_chunked)
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8])
+@pytest.mark.parametrize("K,N", [(4096, 1024), (512, 4096), (512, 128), (64, 512)])
+def test_fp4_dequant_dot_matches_dequant_reference(K, N, rows):
+    rng = _rng(K * 5 + N + rows)
+    packed = quant.pack_fp4_rows(rng.integers(0, 16, size=(K, N), dtype=np.uint8))
+    bs = random_e4m3(rng, (K // 16, N))
+    x = rng.standard_normal((rows, K)).astype(ml_dtypes.bfloat16)
+    ref = x.astype(np.float32) @ quant.dequant_fp4_np(packed, bs)
+    out = np.asarray(run_fp4_dequant_dot(jnp.asarray(x), jnp.asarray(packed),
+                                         jnp.asarray(quant.fp4_scales_to_chunked(bs, K))))
+    assert np.abs(out - ref).max() <= 1e-3 * np.abs(ref).max()
+    # the scale words hold the bf16 bits of every block scale in both halves
+    words = np.asarray(pl.pallas_call(
+        lambda s_ref, o_ref: o_ref.__setitem__(Ellipsis, fp4.scale_words(s_ref)),
+        out_shape=jax.ShapeDtypeStruct((K // 16, N), jnp.int32), in_specs=[VM], out_specs=VM,
+        interpret=INTERPRET)(jnp.asarray(quant.fp4_scales_to_chunked(bs, K)))).view(np.uint32)
+    bits = bs.astype(np.float32).view(np.uint32) >> 16
+    assert np.array_equal(words, bits | (bits << 16))
 
 
 def test_global_scales_and_scratch():
@@ -341,7 +382,7 @@ def test_global_scales_and_scratch():
     assert len(fp4.scratch_shapes(MINI, 4)) == len(fp4.Fp4Scratch.__dataclass_fields__)
 
 
-@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("batch", [1, 4, 8])
 def test_expert_slot_dots_in_kernel(converted, batch):
     """`gate_up_dot` / `down_dot` on a real container slot (MINI shapes, one expert) against the
     prefill-style bf16 dequant (`prefill.dequantized_experts`)."""
@@ -353,10 +394,15 @@ def test_expert_slot_dots_in_kernel(converted, batch):
     rng = _rng(batch)
     h1 = rng.standard_normal((batch, MINI.moe_hidden)).astype(ml_dtypes.bfloat16).astype(np.float32)
 
-    def kernel(h_ref, gu_ref, gbs_ref, dn_ref, dbs_ref, gs_ref, gu_out, y_out, h_bd):
-        sc = fp4.Fp4Scratch(gu_ref, gbs_ref, dn_ref, dbs_ref, gs_ref, h_bd, *([None] * 6))
-        fp4.block_diag16_to_ref(h_bd, h_ref[...])
-        gu = fp4.gate_up_dot(sc, 0, batch)
+    scratch = fp4.scratch_shapes(MINI, batch, TP, slots=1)[5:8]  # h_bd, gu_sd, dn_sd
+
+    def kernel(h_ref, gu_ref, gbs_ref, dn_ref, dbs_ref, gs_ref, gu_out, y_out, h_bd, gu_sd, dn_sd):
+        sc = fp4.Fp4Scratch(gu_ref, gbs_ref, dn_ref, dbs_ref, gs_ref, h_bd, gu_sd, dn_sd,
+                            *([None] * 7))
+        h = h_ref[...]
+        if not fp4.use_dequant(batch):
+            fp4.block_diag16_to_ref(h_bd, h)
+        gu = fp4.gate_up_dot(sc, 0, h)
         gu_out[...] = gu
         a = (jax.nn.silu(gu[:, :Is]) * gu[:, Is:]).astype(jnp.bfloat16).astype(jnp.float32)
         y_out[...] = fp4.down_dot(sc, 0, a)
@@ -367,7 +413,7 @@ def test_expert_slot_dots_in_kernel(converted, batch):
                    jax.ShapeDtypeStruct((batch, MINI.moe_hidden), jnp.float32)),
         in_specs=[VM] * 6,
         out_specs=(VM, VM),
-        scratch_shapes=[pltpu.VMEM(fp4.block_diag16_shape(MINI.moe_hidden, batch), jnp.bfloat16)],
+        scratch_shapes=list(scratch),
         interpret=INTERPRET,
     )(jnp.asarray(h1), *(slots[n] for n in names))
     w = {n: jnp.asarray(load.read_rank_array(dst, r, n))[:, e:e + 1] for n in names}
@@ -584,15 +630,21 @@ def _routes(cfg, batch, rng, distinct=None):
     return idx.astype(np.int32), w / w.sum(1, keepdims=True)
 
 
-STREAM_CASES = [(MINI, 1, None), (MINI, 4, None), (MINI, 8, 4), (MINI, 8, None),
-                (Config(layers=2, experts=16), 1, None), (Config(layers=2, experts=16), 8, None)]
+STREAM_CASES = [(MINI, 1, None, 8), (MINI, 2, None, 8), (MINI, 4, None, 8), (MINI, 4, None, 4),
+                (MINI, 8, 4, 8), (MINI, 8, None, 8), (MINI, 8, None, 9),
+                (Config(layers=2, experts=16), 1, None, 8), (Config(layers=2, experts=16), 8, None, 8),
+                (Config(layers=2, experts=16), 4, None, 8)]
 
 
-@pytest.mark.parametrize("cfg,batch,distinct", STREAM_CASES,
-                         ids=["mini-b1", "mini-b4", "mini-b8-4experts", "mini-b8", "real-b1", "real-b8"])
-def test_fp4_expert_stream_matches_reference(cfg, batch, distinct):
+@pytest.mark.parametrize("cfg,batch,distinct,min_batch", STREAM_CASES,
+                         ids=["mini-b1", "mini-b2", "mini-b4", "mini-b4-dequant", "mini-b8-4experts",
+                              "mini-b8", "mini-b8-blockdiag", "real-b1", "real-b8", "real-b4"])
+def test_fp4_expert_stream_matches_reference(cfg, batch, distinct, min_batch, monkeypatch):
+    """`min_batch` (patched `fp4.DEQUANT_MIN_BATCH`) selects the dot formulation: 8 = the
+    default (block-diagonal below B=8, dequant at 8), 4 / 9 force the other one."""
     if INTERPRET and cfg.moe_hidden > MINI.moe_hidden and batch > 1:
-        pytest.skip("real-width B=8 stream is slow in interpret mode")
+        pytest.skip("real-width B>1 streams are slow in interpret mode")
+    monkeypatch.setattr(fp4, "DEQUANT_MIN_BATCH", min_batch)
     rng = _rng(batch * 3 + (distinct or 0))
     weights, gate_up, down = random_fp4_expert_weights(cfg, seed=batch)
     idx, w = _routes(cfg, batch, rng, distinct)

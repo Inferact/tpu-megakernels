@@ -193,7 +193,8 @@ def parse_options(options):
 
 
 SKIPPABLE = frozenset(
-    {"collectives", "attention", "experts", "route", "lm_head", "dense_dots", "expert_dots"}
+    {"collectives", "attention", "experts", "route", "lm_head", "dense_dots", "expert_dots",
+     "expert_dma"}
 )
 
 
@@ -551,7 +552,7 @@ def _kernel_body(cfg: Config, batch, tp, opts):
             else:
                 idx, w = moe.route_from_logits(cfg, logits, v("router_bias", l))
             moe.route_to_scratch(cfg, sc, idx, w)
-            if "experts" not in skip:
+            if "experts" not in skip and "expert_dma" not in skip:
                 xp.start(cfg, l, experts, sc)
             h0 = all_gather(r16(h0), phase + 1)  # [B, Hm]
             h1 = stream.norm_to_bf16(h0, v("pre_expert_norm", l), cfg.rms_eps)
@@ -571,6 +572,8 @@ def _kernel_body(cfg: Config, batch, tp, opts):
                         stream.flush_deferred(ring)
 
                 extra = {} if "expert_dots" not in skip else {"compute": False}
+                if "expert_dma" in skip:  # fp4 profiling: no expert DMAs / waits (stale slots)
+                    extra["dma"] = False
                 xp.stream(cfg, l, h1, experts, sc, started=True, after_wave=after_wave, **extra)
                 assert not ring.deferred  # flushed inside the wave loop (>= 1 wave per layer)
             else:
