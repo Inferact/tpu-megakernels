@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "description": "8 deterministic evaluation prompts for teacher-forced parity verification (including prompt_08 >= 4096 tokens).",
+  "continuation_steps": 128,
+  "prompts": [
+    {
+      "id": "prompt_01_gsm8k_train",
+      "category": "math_reasoning",
+      "min_tokens": 64,
+      "text": "Question: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\nLet's think step by step."
+    },
+    {
+      "id": "prompt_02_number_theory",
+      "category": "math_reasoning",
+      "min_tokens": 96,
+      "text": "Prove that for every prime p > 3, p^2 - 1 is divisible by 24. Then compute (97^2 - 1) / 24 explicitly and verify each factor step by step."
+    },
+    {
+      "id": "prompt_03_pallas_tpu_kernel",
+      "category": "code_generation",
+      "min_tokens": 128,
+      "text": "Write a JAX Pallas kernel for TPU v7x that computes a block-scaled FP8 matrix-vector product y = A @ x where A has shape [M, K] in float8_e4m3fn with [M // 32, K // 32] E8M0 power-of-two scales, accumulating in float32 and returning bfloat16."
+    },
+    {
+      "id": "prompt_04_sinkhorn_doubly_stochastic",
+      "category": "algorithm_analysis",
+      "min_tokens": 128,
+      "text": "Explain how Sinkhorn-Knopp iterative row and column normalization turns a positive 4x4 matrix into a doubly stochastic matrix in Multi-stream Hyper-Connections (mHC), why the spectral norm stays bounded by 1, and what happens to deep residual stability when Sinkhorn normalization is removed."
+    },
+    {
+      "id": "prompt_05_speculative_decoding",
+      "category": "systems_architecture",
+      "min_tokens": 160,
+      "text": "Derive the expected tokens accepted per verification step for speculative decoding with block size K = 5 under greedy verification, and explain why rolling back sliding-window ring buffers and 2-to-1 KV compressor states on rejected draft tokens preserves exact token-for-token equivalence with autoregressive greedy decoding."
+    },
+    {
+      "id": "prompt_06_dynamic_programming",
+      "category": "code_generation",
+      "min_tokens": 160,
+      "text": "Implement an O(N log N) solution in Python for finding both the length and the lexicographically smallest subsequence of the longest strictly increasing subsequence of an integer array, and trace it on [10, 9, 2, 5, 3, 7, 101, 18, 4, 8, 6, 12]."
+    },
+    {
+      "id": "prompt_07_distributed_collectives",
+      "category": "systems_architecture",
+      "min_tokens": 192,
+      "text": "Compare butterfly XOR-peer remote DMA all-reduce across 32 TensorCores in a 2x2x4 TPU pod slice against ring all-reduce for small decode payloads (10 KiB to 64 KiB per step). Include latency equations in terms of hop count, per-hop startup overhead, and link bandwidth."
+    },
+    {
+      "id": "prompt_08_long_context_4096",
+      "category": "long_context_needle_and_synthesis",
+      "min_tokens": 4224,
+      "repeat_to_min_tokens": true,
+      "text": "System Architecture Dossier — DeepSeek-V4.1-Flash Long-Context Verification Log.\nSection 1: Overview of Compressed Sliding Attention (CSA). Every backbone layer maintains a 128-token sliding-window KV ring buffer quantized to FP8 (E4M3 with per-32 UE8M0 power-of-two scales). Layers 2 through 19 apply 2-to-1 softmax-gated token compression (compress_ratio = 2), where KV source layers 2, 8, and 14 pool pairs of consecutive token states in float32 and quantize the resulting 512-dimensional latent vectors to MXFP4 with per-16 E4M3 scales. Layer 20 switches to 1-to-1 global KV compression (compress_ratio = 1) and serves as the candidate block source for layers 24, 28, 32, and 36, selecting the top 2048 blocks of 8 positions while pinning the most recent block to +infinity.\nSection 2: Multi-stream Hyper-Connections (mHC). The residual stream is replicated across 4 parallel copies of dimension 5120. At each sublayer, a learned float32 linear projection of the flattened 20480-dimensional stream produces 4 pre-mix weights, 4 post-mix weights, and a 4x4 combination matrix normalized by 20 iterations of Sinkhorn-Knopp row and column scaling.\nSection 3: Engram N-Gram Lookup Tables. At layers 1 and 14, host-side int64 rolling XOR-multiply hashes over normalized 2-grams, 3-grams, and 4-grams index into 24 disjoint prime-modulus buckets totaling 384,006,168 rows (layer 1) and 384,016,682 rows (layer 14).\nSection 4: Verification Fact Ledger. Record the following invariant constants across the long context window: [ANCHOR_FACT_ALPHA = 384006168], [ANCHOR_FACT_BETA = 384016682], [ANCHOR_FACT_GAMMA = 160000], [ANCHOR_FACT_DELTA = 65536].\nQuestion at the end of the 4096-token context: Repeat the four anchor facts (ALPHA, BETA, GAMMA, DELTA) in order and explain how layer 20's candidate block selection interacts with layer 24's reindexer when sequence length exceeds 4096 tokens.\n"
+    }
+  ]
+}
