@@ -12,6 +12,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gcs = [
+    "google-cloud-storage>=3.4,<4",
+    "google-crc32c>=1.5",
+    "python-dotenv>=1,<2",
+]
 eval = [
     "lm-eval[api]>=0.4.9,<0.5",
 ]

@@ -246,7 +246,8 @@ class OpenAIServer:
 
     def __init__(self, host, port, tokenizer, *, model_name, chat_mode, default_max_tokens, max_prompt_tokens,
                  bos_token_id, max_model_len=None, default_temperature=0.0, default_top_p=1.0,
-                 log=print, chat_render=None, streamer_factory=None, channel_splitter=None):
+                 log=print, chat_render=None, streamer_factory=None, channel_splitter=None,
+                 token_channel_splitter=None):
         self.tokenizer = tokenizer
         self.model_name = model_name
         self.chat_mode = chat_mode
@@ -262,6 +263,7 @@ class OpenAIServer:
             lambda tok, *, chat, initial_channel: TokenStreamer(tok, chat=chat, initial_channel=initial_channel)
         )
         self.channel_splitter = channel_splitter or split_channels
+        self.token_channel_splitter = token_channel_splitter
         self.log = log
         self.jobs: queue.Queue[Job | None] = queue.Queue()
         self.stopping = threading.Event()
@@ -411,6 +413,9 @@ class OpenAIServer:
 
     def _run(self, job: Job, timeout=None) -> Result:
         self._submit(job)
+        return self._wait(job, timeout)
+
+    def _wait(self, job: Job, timeout=None) -> Result:
         if not job.done.wait(timeout):
             raise RuntimeError("generation timed out")
         if job.error:
@@ -446,13 +451,18 @@ class OpenAIServer:
         echo = bool(body.get("echo", False))
         choices = []
         prompt_tokens_total = completion_tokens_total = 0
-        for index, prompt in enumerate(prompt_list):
+        jobs = []
+        for prompt in prompt_list:
             tokens = self._prompt_tokens(prompt)
             job = self._job(tokens, params, score=bool(echo and params.logprobs), kind="completion",
                             chat_mode=self.chat_mode, echo=echo, logprobs=params.logprobs)
-            result = self._run(job)
-            choices.append(self._completion_choice(index, tokens, job, result))
-            prompt_tokens_total += len(tokens)
+            jobs.append(job)
+        for job in jobs:
+            self._submit(job)
+        for index, job in enumerate(jobs):
+            result = self._wait(job)
+            choices.append(self._completion_choice(index, job.tokens, job, result))
+            prompt_tokens_total += len(job.tokens)
             completion_tokens_total += len(result.generated)
         return {
             "id": f"cmpl-{uuid.uuid4().hex[:24]}", "object": "text_completion", "created": int(time.time()),
@@ -514,7 +524,10 @@ class OpenAIServer:
         result = self._run(job)
         generated = list(result.generated)
         end_stripped = generated[:-1] if result.finish_reason == "stop" and generated else generated
-        reasoning, content = self.channel_splitter(self._decode(end_stripped))
+        if self.token_channel_splitter is None:
+            reasoning, content = self.channel_splitter(self._decode(end_stripped))
+        else:
+            reasoning, content = self.token_channel_splitter(end_stripped)
         content, stopped = apply_stop_strings(content, job.stop)
         message = {"role": "assistant", "content": content}
         if reasoning is not None:
