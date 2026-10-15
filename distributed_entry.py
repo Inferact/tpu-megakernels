@@ -1,4 +1,4 @@
-"""Initialize all four TPU hosts before executing a TP32 experiment."""
+"""Initialize the allocated TPU hosts before executing a distributed entry point."""
 
 import os
 import runpy
@@ -37,7 +37,7 @@ import jax
 print(f"initializing rank={rank} host={socket.gethostname()}", flush=True)
 jax.distributed.initialize(
     coordinator_address=os.environ["TP32_COORDINATOR"],
-    num_processes=4,
+    num_processes=int(os.environ.get("SLURM_NTASKS", "4")),
     process_id=rank,
     initialization_timeout=180,
 )
