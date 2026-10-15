@@ -1,8 +1,7 @@
 """Muse-Spark-Open configuration and reference model equations.
 
-Mirrors the torchTPU reference (p-vllm-torchtpu .../muse_spark/{model,layers,
-weights}.py) for the open meta-models/Muse-Spark-Open-816B-A42B-NVFP4
-checkpoint: FP32 residual stream with gated blends, zero-centered pre-norms,
+Reference equations for meta-models/Muse-Spark-Open-816B-A42B-NVFP4:
+FP32 residual stream with gated blends, zero-centered pre-norms,
 weight-first post-norms, weightless per-head QK/o norms, interleaved RoPE on
 sliding-window layers, NoPE on full-attention layers, sigmoid+bias top-8
 routing, pooled MoE with per-expert post-norm before the FP32 weighted sum,

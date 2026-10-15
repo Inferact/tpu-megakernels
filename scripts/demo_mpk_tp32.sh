@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
-# Interactive Muse-Spark-Open-816B-A42B-NVFP4 demo on TP32.
-#
-# Usage: with a 4-node allocation (salloc, or a batch job holding the nodes,
-# e.g. `sbatch --wrap="sleep 12h"`), run this script from the login node or
-# from any node, naming the job when SLURM_JOB_ID is not already set:
-#   JOBID=<job id> bash scripts/demo_mpk_tp32.sh [--chat response|none] [--max-tokens N] [--prompt "..."]
-# Each host loads its own 8 ranks of the packed bundle from
-# $MPK_PACKED_WEIGHTS_TP32. Only one
-# demo per allocation.
+# Muse-Spark-Open TP32 demo on a four-host Slurm allocation.
+# Usage: JOBID=<job> bash scripts/demo_mpk_tp32.sh [demo arguments]
+# Set MPK_PACKED_WEIGHTS_TP32 or pass --weights; run one demo per allocation.
 set -uo pipefail
 JOBID="${JOBID:-${SLURM_JOB_ID:-}}"
 : "${JOBID:?Set JOBID=<slurm job id> of a 4-node allocation (or run inside salloc)}"

@@ -1,8 +1,7 @@
-"""CPU tests for the Muse-Spark sharded prefill (plain XLA) against the oracle.
+"""CPU comparisons of Muse-Spark-Open sharded prefill and reference equations.
 
-Runs make_prefill's shard_map on a single CPU device (tp=1): validates the
-sharded math path end to end, including NVFP4 packed-expert dequantization.
-The Pallas decode kernel is validated on TPU (see dev/tpu_mini_check.py).
+Runs make_prefill's shard_map on one CPU device (tp=1), including NVFP4
+packed-expert dequantization.
 """
 
 import jax

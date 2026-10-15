@@ -1,9 +1,8 @@
-"""CPU tests for the Muse-Spark TP32 prefill (plain XLA) against the oracle.
+"""CPU comparisons of Muse-Spark-Open TP32 prefill and reference equations.
 
 Runs make_prefill's shard_map on 32 forced CPU devices (kv_heads=2 < 32 ranks:
 rank groups share one KV head). Needs
 ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=32``.
-The Pallas decode kernel is validated on TPU (see dev/tpu_mini_check_tp32.py).
 """
 
 import jax
