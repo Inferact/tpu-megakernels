@@ -129,7 +129,7 @@ def main() -> None:
     world_size = jax.device_count()
     mesh = create_v7x_mesh()
 
-    cfg = tiny_config() if args.tiny else full_config(max_seq_len=args.context)
+    cfg = tiny_config() if args.tiny else full_config()
     tokenizer_path: str | Path | None = None
     if not args.tiny:
         try:
@@ -145,7 +145,9 @@ def main() -> None:
 
     if args.weights:
         _log(f"[{time.perf_counter() - started:6.1f}s] loading pre-sharded weights from {args.weights} (world_size={world_size})")
-        sharded_weights, load_stats = load_presharded(args.weights, mesh=mesh, cfg=cfg)
+        sharded_weights, cfg, _ = load_presharded(
+            args.weights, mesh=mesh, max_seq_len=args.context, return_metadata=True)
+        load_stats = {"total_load_s": time.perf_counter() - started}
         if tokenizer_path is None and (Path(args.weights) / "tokenizer.json").exists():
             tokenizer_path = Path(args.weights)
         _log(f"[{time.perf_counter() - started:6.1f}s] weights resident in {load_stats['total_load_s']:.2f}s")
@@ -160,6 +162,7 @@ def main() -> None:
         sharded_weights,
         tokenizer_path=tokenizer_path,
         default_backend=args.backend,
+        max_seq_len=args.context,
     )
 
     if args.serve:
